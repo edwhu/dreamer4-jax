@@ -18,10 +18,18 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
         - [ ] RoPE
         - [ ] SwiGLU
         - [ ] GQA
+- [ ] Add actions and rewards to Toy Video Dataset
 - [ ] Interactive Dynamics Model
 - [ ] RL Training
 - [ ] Small offline RL dataset generation (Atari-5 or Craftax)
 - [ ] Interactive decision making
+
+## Installation
+Use `uv` to create the virtual environment and install dependencies:
+```bash
+uv sync      # creates .venv and installs packages from uv.lock
+source .venv/bin/activate
+```
 
 ## Dataset generation
 
