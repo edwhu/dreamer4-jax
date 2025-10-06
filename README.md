@@ -30,6 +30,7 @@ Use `uv` to create the virtual environment and install dependencies:
 uv sync      # creates .venv and installs packages from uv.lock
 source .venv/bin/activate
 ```
+By default, this installs the CPU version of jax. Follow the instructions in the Jax repo to install the GPU version (e.g. `uv pip install "jax[cuda12]"`).
 
 ## Dataset generation
 
