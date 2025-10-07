@@ -6,6 +6,7 @@ from flax.core import freeze, unfreeze, FrozenDict
 from tokenizer import Encoder, Decoder
 from data import make_iterator, patchify, unpatchify
 import imageio
+from jaxlpips import LPIPS
 
 # --- helpers ---
 temporal_patchify = jax.jit(
@@ -18,13 +19,6 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
-
-def make_models(num_patches, D_patch, enc_n_latents=2, enc_d_bottleneck=3):
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_heads=2, depth=2,
-                      dropout=0, d_bottleneck=enc_d_bottleneck, mae_p_min=0.0, mae_p_max=0.9)
-    decoder = Decoder(d_model=8, n_heads=2, depth=2, n_patches=num_patches,
-                      d_patch=D_patch, dropout=0)
-    return encoder, decoder
 
 def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck):
     rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
@@ -76,6 +70,48 @@ def recon_loss_from_mae(pred_btnd, patches_btnd, mae_mask):
     num = jnp.maximum(mae_mask.sum(), 1)
     return jnp.sum((masked_pred - masked_target) ** 2) / num
 
+# --- instantiate once (top-level / main) ---
+lpips_loss_fn = LPIPS(pretrained_network="alexnet")  # or "vgg", "squeeze"
+
+def lpips_on_mae_recon(
+    pred, target, mae_mask, *, H, W, C, patch,
+    subsample_frac: float = 1.0
+):
+    """
+    pred:    (B,T,Np,D)
+    target:  (B,T,Np,D)
+    mae_mask:     (B,T,Np,1)  True where patch is masked (must reconstruct)
+    Returns scalar LPIPS averaged over (B,T).
+    """
+    # 1) Blend GT for visible patches => "recon_masked"
+    recon_masked_btnd = jnp.where(mae_mask, pred, target)
+
+    # 2) Unpatchify to (B,T,H,W,C) in [0,1]
+    recon_imgs = temporal_unpatchify(recon_masked_btnd, H, W, C, patch)
+    target_imgs = temporal_unpatchify(target,        H, W, C, patch)
+
+    # 3) Optional subsample frames over T to save compute
+    if subsample_frac < 1.0:
+        B, T = recon_imgs.shape[:2]
+        step = max(1, int(1.0/subsample_frac))
+        idx = jnp.arange(T)[::step]
+        recon_imgs = recon_imgs[:, idx]
+        target_imgs = target_imgs[:, idx]
+
+    # 4) Rescale to [-1,1] for LPIPS
+    recon_lp = jnp.clip(recon_imgs * 2.0 - 1.0, -1.0, 1.0)
+    target_lp = jnp.clip(target_imgs * 2.0 - 1.0, -1.0, 1.0)
+
+    # 5) Flatten B,T for a single LPIPS call: (B*T,H,W,C)
+    BT = recon_lp.shape[0] * recon_lp.shape[1]
+    H_, W_, C_ = recon_lp.shape[2], recon_lp.shape[3], recon_lp.shape[4]
+    recon_lp = recon_lp.reshape((BT, H_, W_, C_))
+    target_lp = target_lp.reshape((BT, H_, W_, C_))
+
+    # 6) LPIPS returns per-example loss; average it
+    lp = lpips_loss_fn(recon_lp, target_lp)  # shape (BT,)
+    return jnp.mean(lp)
+
 # --- viz step ---
 @partial(jax.jit, static_argnames=("encoder","decoder","patch"))
 def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, drop_key):
@@ -106,8 +142,9 @@ def viz_step(encoder, decoder, enc_vars, dec_vars, batch, *, patch, mae_key, dro
 
 
 # --- train step ---
-@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch"))
-def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *, patch, master_key, step):
+@partial(jax.jit, static_argnames=("encoder","decoder","tx","patch","H","W","C", "lpips_weight", "lpips_frac"))
+def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch, *,
+               patch, H, W, C, master_key, step, lpips_weight=0.2, lpips_frac=1.0):
     """
     (master_key, params, opt_state, model_state, batch)
         │
@@ -135,8 +172,22 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
         pred, mae_info = forward_apply(encoder, decoder, ev, dv, patches_btnd,
                                        mae_key=mae_key, drop_key=drop_key, train=True)
         mae_mask, keep_prob = mae_info
-        loss = recon_loss_from_mae(pred, patches_btnd, mae_mask)
-        return loss, {"loss": loss, "keep_prob": keep_prob}
+        mse = recon_loss_from_mae(pred, patches_btnd, mae_mask)
+
+        # LPIPS on recon_masked vs target (unpatchified frames)
+        lpips = lpips_on_mae_recon(
+            pred, patches_btnd, mae_mask,
+            H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
+        )
+        total = mse + lpips_weight * lpips
+        aux = {
+            "loss_total": total,
+            "loss_mse": mse,
+            "loss_lpips": lpips,
+            "keep_prob": keep_prob,
+        }
+
+        return total, aux
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
@@ -151,8 +202,8 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
 # --- usage example ---
 if __name__ == "__main__":
     rng = jax.random.PRNGKey(0)
-    B, T, H, W, C, square_size = 2, 10, 8, 8, 3, 4
-    patch = 2
+    B, T, H, W, C, square_size = 64, 8, 64, 64, 3, 8
+    patch = 4
     num_patches = (H // patch) * (W // patch)
     D_patch = patch * patch * C
 
@@ -168,42 +219,64 @@ if __name__ == "__main__":
 
 
     # models
-    enc_n_latents, enc_d_bottleneck = 2, 3
-    encoder, decoder = make_models(num_patches, D_patch, enc_n_latents, enc_d_bottleneck)
+    enc_n_latents, enc_d_bottleneck = 2, 16
+    # encoder, decoder = make_models(num_patches, D_patch, enc_n_latents, enc_d_bottleneck)
+    enc_kwargs = {
+        "d_model": 32,
+        "n_latents": enc_n_latents,
+        "n_heads": 8,
+        "depth": 8,
+        "dropout": 0.3,
+        "d_bottleneck": enc_d_bottleneck,
+        "mae_p_min": 0.0,
+        "mae_p_max": 0.9,
+    }
+    dec_kwargs = {
+        "d_model": 32,
+        "n_heads": 8,
+        "n_patches": num_patches,
+        "depth": 8,
+        "d_patch": D_patch,
+        "dropout": 0.3,
+    }
+    encoder = Encoder(**enc_kwargs)
+    decoder = Decoder(**dec_kwargs)
+
     first_patches = temporal_patchify(first_batch, patch)
     rng, enc_vars, dec_vars = init_models(rng, encoder, decoder, first_patches, B, T, enc_n_latents, enc_d_bottleneck)
 
     # optim
     params = pack_params(enc_vars, dec_vars)
-    tx = optax.adamw(3e-4)
+    tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
 
     # train loop
     for step in range(100000):
         # for now, fix rng to a single seed to debug.
-        data_rng = jax.random.PRNGKey(0)
-        _, batch = next_batch(data_rng)
-        # rng, batch = next_batch(rng)
+        # data_rng = jax.random.PRNGKey(0)
+        # _, batch = next_batch(data_rng)
+        rng, batch = next_batch(rng)
         rng, master_key = jax.random.split(rng)
         params, opt_state, enc_vars, dec_vars, aux = train_step(
             encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-            patch=patch, master_key=master_key, step=step
+            patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=0.2, lpips_frac=0.5
         )
-        mse_loss = float(aux['loss'])
+        mse_loss = float(aux['loss_mse'])
         rmse_loss = jnp.sqrt(mse_loss)
-        print(f"step {step:03d} | rmse loss={rmse_loss:.6f} | keep_prob≈{float(jnp.mean(aux['keep_prob'])):.3f}")
+        lpips_loss = float(aux['loss_lpips'])
+        total_loss = float(aux['loss_total'])
+        if step % 100 == 0:
+            print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f}")
         if step % 10000 == 0:
             rng, viz_key = jax.random.split(rng)
             mae_key, drop_key = jax.random.split(viz_key)
             out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
                         patch=patch, mae_key=mae_key, drop_key=drop_key)
 
-            target = temporal_unpatchify(out["target"], H, W, C, patch).squeeze()
-            masked_in = temporal_unpatchify(out["masked_input"], H, W, C, patch).squeeze()
-            rec_masked  = temporal_unpatchify(out["recon_masked"], H, W, C, patch).squeeze()
-            rec_unmasked  = temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze()
-
-            # first stack the batches
+            target = jnp.concatenate(temporal_unpatchify(out["target"], H, W, C, patch).squeeze(), axis=1)
+            masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], H, W, C, patch).squeeze(), axis=1)
+            rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], H, W, C, patch).squeeze(), axis=1)
+            rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze(), axis=1)
             grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
-            grid = jnp.asarray(jnp.concatenate(grid, axis=1) * 255.0, dtype=jnp.uint8)
+            grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
             imageio.imwrite(f"step_{step:03d}.png", grid)

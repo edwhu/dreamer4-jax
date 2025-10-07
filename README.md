@@ -13,7 +13,8 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] MAE encoder decoder 
     - [x] MSE loss
     - [x] Training loop
-    - [ ] LPIPS loss
+    - [x] LPIPS loss
+    - [ ] checkpointing
     - [ ] Smaller tweaks
         - [ ] RoPE
         - [ ] SwiGLU
