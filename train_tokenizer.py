@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.core import freeze, unfreeze, FrozenDict
-from tokenizer import Encoder, Decoder
+from models import Encoder, Decoder
 from data import make_iterator, patchify, unpatchify
 import imageio
 from jaxlpips import LPIPS

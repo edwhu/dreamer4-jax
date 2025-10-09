@@ -15,14 +15,20 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] Training loop
     - [x] LPIPS loss
     - [x] checkpointing
-    - [ ] wandb logging
-    - [ ] Smaller tweaks
+    - [ ] Minor improvements
+        - [ ] wandb logging
+        - [ ] cli args / config 
         - [ ] RoPE
         - [ ] SwiGLU
         - [ ] GQA
-- [ ] Add actions and rewards to Toy Video Dataset
 - [ ] Interactive Dynamics Model
-- [ ] RL Training
+    - [x] Add actions to Toy Video Dataset
+    - [ ] Add multi-modality support for efficient transformer block
+    - [ ] setup architecture
+    - [ ] shortcut forcing 
+- [ ] Imagination training 
+    - [ ] Behavior cloning and reward model
+    - [ ] RL Training
 - [ ] Small offline RL dataset generation (Atari-5 or Craftax)
 - [ ] Interactive decision making
 
@@ -96,4 +102,4 @@ Then, we train the $z$ representation using a decoder. The decoder is also a tra
 The causal tokenizer is trained using a masked autoencoder loss. We randomly mask out a portion of the input patches with probability $U(0, 0.9)$, and replace the missing portion with a learnable embedding. We then pass the masked input through the encoder and decoder, and train the model with reconstruction loss (MSE) between the original and reconstructed images.
 
 ## Interactive Dynamics 
-TODO
+- need to make sure we are handling multiple modalities correctly, where latent tokens can read from everything but other tokens can only attend amongst tokens with the same modality 
