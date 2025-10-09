@@ -81,22 +81,76 @@ class MLP(nn.Module):
         h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
         return h
 # ---------- axial attention layers ----------
+class SpaceSelfAttentionModality(nn.Module):
+    """
+    Space self-attention with modality routing.
 
-class SpaceSelfAttention(nn.Module):
+    Args:
+      d_model: int
+      n_heads: int
+      modality_ids: jnp.ndarray with shape (S,), per-token modality id for the S tokens.
+                    Convention: latents are the first `n_latents` tokens; you can set their id to -1.
+      n_latents: int, number of latent tokens at the beginning of S.
+      mode: str in {"encoder", "decoder"}.
+            - "encoder": latents→all; non-latents→same-modality only.
+            - "decoder": latents→latents-only; non-latents→same-modality + latents.
+      dropout: float
+    """
     d_model: int
     n_heads: int
+    modality_ids: jnp.ndarray  # (S,)
+    n_latents: int
+    mode: str = "encoder"      # or "decoder"
     dropout: float = 0.0
+
+    def setup(self):
+        # Cache a (S,S) boolean mask indicating allowed key for each query index, per mode.
+        S = int(self.modality_ids.shape[0])
+
+        # Broadcast helpers
+        q_idx = jnp.arange(S)[:, None]       # (S,1)
+        k_idx = jnp.arange(S)[None, :]       # (1,S)
+
+        is_q_lat = q_idx < self.n_latents     # (S,1) bool
+        is_k_lat = k_idx < self.n_latents     # (1,S) bool
+
+        q_mod = self.modality_ids[q_idx]      # (S,1)
+        k_mod = self.modality_ids[k_idx]      # (1,S)
+        same_mod = (q_mod == k_mod)           # (S,S)
+
+        if self.mode == "encoder":
+            # latents -> all; non-latents -> same modality only (no access to latents unless same modality==latent, which they aren't)
+            allow_lat_q = jnp.ones((S, S), dtype=bool)             # lat q attends to everything
+            allow_nonlat_q = same_mod                              # non-lat q attends within itself only
+            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
+        elif self.mode == "decoder":
+            # latents -> latents only; non-latents -> same modality OR latents
+            allow_lat_q = is_k_lat                                  # lat q -> lat k only
+            allow_nonlat_q = jnp.logical_or(same_mod, is_k_lat)     # non-lat q -> same mod + latents
+            mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
+        else:
+            raise ValueError(f"Unknown mode {self.mode}")
+
+        # Save (1,1,S,S) so it broadcasts over batch*time and heads -> (B*T, 1, S, S)
+        modality_mask = mask[None, None, :, :]                   # (1,1,S,S)
+        self.modality_mask = self.variable("constants", "modality_mask", lambda: modality_mask)
+
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
-        # x: (B, T, S, D) -> attend across S within a timestep
+        # x: (B, T, S, D)  -> attention across S within each (B,T)
         B, T, S, D = x.shape
         x_ = x.reshape(B*T, S, D)
+
+        # Flax MHA mask shape can be (batch, num_heads, q_len, k_len). We want one mask per (B*T).
+        mask = jnp.broadcast_to(self.modality_mask.value, (B*T, 1, S, S))   # (B*T,1,S,S)
+
         y_ = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
             qkv_features=self.d_model,
             dropout_rate=self.dropout,
             deterministic=deterministic,
-        )(x_, x_)
+        )(x_, x_, mask=mask)
+
         y = y_.reshape(B, T, S, D)
         return y
 
@@ -138,11 +192,12 @@ class TimeSelfAttention(nn.Module):
             return out
 
 # ---------- a single block-causal layer ----------
-
 class BlockCausalLayer(nn.Module):
     d_model: int
     n_heads: int
     n_latents: int
+    modality_ids: jnp.ndarray     # (S,)
+    space_mode: str               # "encoder" or "decoder"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     layer_index: int = 0
@@ -151,12 +206,19 @@ class BlockCausalLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
-        # Space attention (within timestep)
+        # --- Space attention (within timestep, modality-aware) ---
         y = RMSNorm()(x)
-        y = SpaceSelfAttention(self.d_model, self.n_heads, self.dropout)(y, deterministic=deterministic)
+        y = SpaceSelfAttentionModality(
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            modality_ids=self.modality_ids,
+            n_latents=self.n_latents,
+            mode=self.space_mode,
+            dropout=self.dropout,
+        )(y, deterministic=deterministic)
         x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
 
-        # Time attention (causal across timesteps), only on certain layers
+        # --- Time attention (causal across timesteps), only on some layers ---
         if (self.layer_index + 1) % self.time_every == 0:
             y = RMSNorm()(x)
             y = TimeSelfAttention(
@@ -165,7 +227,7 @@ class BlockCausalLayer(nn.Module):
             )(y, deterministic=deterministic)
             x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
 
-        # MLP
+        # --- MLP ---
         y = RMSNorm()(x)
         y = MLP(self.d_model, self.mlp_ratio, self.dropout)(y, deterministic=deterministic)
         x = x + nn.Dropout(self.dropout)(y, deterministic=deterministic)
@@ -177,6 +239,8 @@ class BlockCausalTransformer(nn.Module):
     n_heads: int
     depth: int
     n_latents: int
+    modality_ids: jnp.ndarray   # (S,)
+    space_mode: str             # "encoder" or "decoder"
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     time_every: int = 4
@@ -184,18 +248,21 @@ class BlockCausalTransformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, *, deterministic: bool):
-        # x: (B, T, S, D)  (S = n_latents + n_patches)
         for i in range(self.depth):
             x = BlockCausalLayer(
-                self.d_model, self.n_heads, self.n_latents, self.dropout, self.mlp_ratio,
+                self.d_model, self.n_heads, self.n_latents,
+                modality_ids=self.modality_ids,
+                space_mode=self.space_mode,
+                dropout=self.dropout, mlp_ratio=self.mlp_ratio,
                 layer_index=i, time_every=self.time_every,
-                latents_only_time=self.latents_only_time, 
+                latents_only_time=self.latents_only_time,
             )(x, deterministic=deterministic)
         return x
 
 class Encoder(nn.Module):
     d_model: int
     n_latents: int
+    n_patches: int
     n_heads: int
     depth: int
     d_bottleneck: int
@@ -209,11 +276,27 @@ class Encoder(nn.Module):
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
+        self.modality_ids = jnp.concatenate([
+            jnp.full((self.n_latents,), -1, dtype=jnp.int32),
+            jnp.zeros((self.n_patches,), dtype=jnp.int32),
+        ], axis=0)
+        self.transformer = BlockCausalTransformer(
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            depth=self.depth,
+            n_latents=self.n_latents,
+            modality_ids=self.modality_ids,
+            space_mode="encoder",                 # << encoder routing
+            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+            time_every=self.time_every,
+            latents_only_time=self.latents_only_time,
+        )
+        self.latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
 
     @nn.compact
-    def __call__(self, patch_tokens_btnd, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    def __call__(self, patch_tokens, *, deterministic: bool = True) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
         # 1) Project patches to D_model
-        proj_patches = self.patch_proj(patch_tokens_btnd)  # (B,T,Np,D)
+        proj_patches = self.patch_proj(patch_tokens)  # (B,T,Np,D)
 
         # 2) MAE mask-and-replace on patch tokens (encoder input only)
         proj_patches_masked, patch_mask, keep_prob = MAEReplacer(name="mae", p_min=self.mae_p_min, p_max=self.mae_p_max)(proj_patches)
@@ -221,30 +304,25 @@ class Encoder(nn.Module):
         # print(f"patch_mask.shape: {patch_mask.shape}")
 
         # 3) Prepend learned latents (owned here)
-        latents = self.param("latents_enc", nn.initializers.normal(0.02), (self.n_latents, self.d_model))
         # print(f"latents.shape: {latents.shape}")
         B, T = proj_patches_masked.shape[:2]
-        lat_btld = jnp.broadcast_to(latents[None, None, ...], (B, T, *latents.shape))
+        latents = jnp.broadcast_to(self.latents[None, None, ...], (B, T, *self.latents.shape))
         # print(f"lat_btld.shape: {lat_btld.shape}")
-        tokens_btSd = jnp.concatenate([lat_btld, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
+        tokens = jnp.concatenate([latents, proj_patches_masked], axis=2)  # (B,T,S=(Np+Nl),D)
         # print(f"tokens_btSd.shape: {tokens_btSd.shape}")
 
         # 4) Add sinusoidal positions (param-free)
-        tokens_btSd = add_sinusoidal_positions(tokens_btSd)
+        tokens = add_sinusoidal_positions(tokens)
 
         # 5) Feed tokens into transformer
-        transformer = BlockCausalTransformer(
-            self.d_model, self.n_heads, self.depth, self.n_latents, self.dropout, self.mlp_ratio,
-            self.time_every, self.latents_only_time, 
-        )
-        encoded_tokens_btSd = transformer(tokens_btSd, deterministic=deterministic)
+        encoded_tokens = self.transformer(tokens, deterministic=deterministic)
         # print(f"encoded_tokens_btSd.shape: {encoded_tokens_btSd.shape}")
 
         # 6) Project latent tokens to bottleneck and tanh
-        latent_tokens_btNld = encoded_tokens_btSd[:, :, :self.n_latents, :]
-        proj_tokens_btNld = nn.tanh(self.bottleneck_proj(latent_tokens_btNld))
+        latent_tokens = encoded_tokens[:, :, :self.n_latents, :]
+        proj_tokens = nn.tanh(self.bottleneck_proj(latent_tokens))
 
-        return proj_tokens_btNld, (patch_mask, keep_prob)  # keep mask if you want diagnostics
+        return proj_tokens, (patch_mask, keep_prob)  # keep mask if you want diagnostics
 
 class Decoder(nn.Module):
     """
@@ -263,6 +341,7 @@ class Decoder(nn.Module):
     d_model: int
     n_heads: int
     depth: int
+    n_latents: int
     n_patches: int
     d_patch: int
     dropout: float = 0.0
@@ -270,51 +349,57 @@ class Decoder(nn.Module):
     time_every: int = 4
     latents_only_time: bool = True
 
+    def setup(self):
+        self.modality_ids = jnp.concatenate([
+            jnp.full((self.n_latents,), -1, dtype=jnp.int32),
+            jnp.zeros((self.n_patches,), dtype=jnp.int32),
+        ], axis=0)
+        self.up_proj = nn.Dense(self.d_model, name="up_proj")
+        self.patch_queries = self.param(
+            "patch_queries",
+            nn.initializers.normal(0.02),
+            (self.n_patches, self.d_model),
+        ) # (Np, D)
+        self.patch_head = nn.Dense(self.d_patch, name="patch_head") # (Np, D_patch)
+        self.transformer = BlockCausalTransformer(
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            depth=self.depth,
+            n_latents=self.n_latents,
+            modality_ids=self.modality_ids,
+            space_mode="decoder",                 # << decoder routing
+            dropout=self.dropout,
+            mlp_ratio=self.mlp_ratio,
+            time_every=self.time_every,
+            latents_only_time=self.latents_only_time,
+        )
+
     @nn.compact
     def __call__(self, z: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
         B, T, N_l, d_bottleneck = z.shape
 
         # 1) Up-project latent bottleneck to d_model (per latent token)
-        up = nn.Dense(self.d_model, name="up_proj")
-        lat_btNld = nn.tanh(up(z))  # (B, T, N_l, D)
+        latents = nn.tanh(self.up_proj(z))  # (B, T, N_l, D)
 
         # 2) Learned per-patch query tokens (owned by the decoder)
-        patch_queries = self.param(
-            "patch_queries",
-            nn.initializers.normal(0.02),
-            (self.n_patches, self.d_model),
-        )  # (Np, D)
-        pq_btNpd = jnp.broadcast_to(
-            patch_queries[None, None, ...],
+        patches = jnp.broadcast_to(
+            self.patch_queries[None, None, ...],
             (B, T, self.n_patches, self.d_model),
         )  # (B, T, Np, D)
 
         # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
-        tokens_btSd = jnp.concatenate([lat_btNld, pq_btNpd], axis=2)
+        tokens = jnp.concatenate([latents, patches], axis=2)
 
         # 4) Add sinusoidal positions
-        tokens_btSd = add_sinusoidal_positions(tokens_btSd)
+        tokens = add_sinusoidal_positions(tokens)
 
         # 5) Axial block-causal transformer
         #    - SpaceSelfAttention over all S tokens (latents + queries)
         #    - TimeSelfAttention only over the first N_l latent tokens
-        x = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            depth=self.depth,
-            dropout=self.dropout,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            latents_only_time=self.latents_only_time,
-            n_latents=N_l,  # <- causal time over latent tokens only
-        )(tokens_btSd, deterministic=deterministic)  # (B, T, S, D)
-
+        x = self.transformer(tokens, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
-        pred_btnd = nn.Dense(self.d_patch, name="patch_head")(x_patches)  # (B,T,Np,D_patch)
-        # output is between 0 and 1
-        pred_btnd = nn.sigmoid(pred_btnd)
-
+        pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
         return pred_btnd
 
 
@@ -322,14 +407,14 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(0)
     B = 2
     T = 10
-    num_patches = 4
-    D_patch = 3
+    n_patches = 4
+    d_patch = 3
     enc_n_latents = 2
     enc_d_bottleneck = 3
-    x = jnp.ones((B, T, num_patches, D_patch))  # (B,T,Np,D_patch)
+    x = jnp.ones((B, T, n_patches, d_patch))  # (B,T,Np,D_patch)
 
-    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_heads=2, depth=2, dropout=0.5, d_bottleneck=enc_d_bottleneck)
-    decoder = Decoder(d_model=8, n_heads=2, depth=2, n_patches=num_patches, d_patch=D_patch, dropout=0.5)
+    encoder = Encoder(d_model=8, n_latents=enc_n_latents, n_patches=n_patches, n_heads=2, depth=2, dropout=0.5, d_bottleneck=enc_d_bottleneck)
+    decoder = Decoder(d_model=8, n_heads=2, depth=2, n_patches=n_patches, n_latents=enc_n_latents, d_patch=d_patch, dropout=0.5)
     # init: give both "mae" and "dropout" keys (dropout only needed if deterministic=False)
     enc_vars = encoder.init(
         {"params": rng, "mae": jax.random.PRNGKey(1), "dropout": jax.random.PRNGKey(2)},

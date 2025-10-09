@@ -292,11 +292,11 @@ if __name__ == "__main__":
     # models
     enc_n_latents, enc_d_bottleneck = 16, 32
     enc_kwargs = {
-        "d_model": 64, "n_latents": enc_n_latents, "n_heads": 4, "depth": 8, "dropout": 0.0,
+        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches, "n_heads": 4, "depth": 8, "dropout": 0.0,
         "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.1, "mae_p_max": 0.1, "time_every": 4,
     }
     dec_kwargs = {
-        "d_model": 64, "n_heads": 4, "n_patches": num_patches, "depth": 8,
+        "d_model": 64, "n_heads": 4, "n_patches": num_patches, "n_latents": enc_n_latents, "depth": 8,
         "d_patch": D_patch, "dropout": 0.0, "time_every": 4,
     }
     encoder = Encoder(**enc_kwargs)

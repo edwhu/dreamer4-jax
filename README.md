@@ -23,7 +23,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
         - [ ] GQA
 - [ ] Interactive Dynamics Model
     - [x] Add actions to Toy Video Dataset
-    - [ ] Add multi-modality support for efficient transformer block
+    - [x] Add multi-modality support for efficient transformer block
     - [ ] setup architecture
     - [ ] shortcut forcing 
 - [ ] Imagination training 
