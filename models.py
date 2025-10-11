@@ -532,8 +532,6 @@ class Dynamics(nn.Module):
     def setup(self):
         # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
         assert self.d_spatial % self.d_bottleneck == 0
-        self.packing_factor = self.d_spatial // self.d_bottleneck
-
         self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
         self.register_tokens = self.param(
             "register_tokens",
@@ -579,10 +577,10 @@ class Dynamics(nn.Module):
         self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head")
 
     @nn.compact
-    def __call__(self, enc_z, actions, signal_idx, step_idx, *, deterministic: bool = True):
+    def __call__(self, packed_enc_tokens, actions, signal_idx, step_idx, *, deterministic: bool = True):
         """
         Args:
-          enc_z:      (B, T, N_l, D_b) encoder outputs before packing (e.g., 512×16)
+          packed_enc_tokens:      (B, T, n_s, d_spatial) packed encoder tokens
           actions:    (B, T, N_a, D_a) raw action tokens
           signal_idx: (B, T) int32 — τ index on the grid for the chosen step size:
                         signal_idx = τ / d, ∈ {0, 1, ..., 1/d - 1}
@@ -595,10 +593,7 @@ class Dynamics(nn.Module):
           signal_token:   (B, T, 1, d_model)
           step_token:     (B, T, 1, d_model)
         """
-        # --- 1) Pack encoder tokens: (B, T, 512, 16) -> (B, T, 256, 32) as example
-        packed_enc_tokens = rearrange(
-            enc_z, 'b t (n_s k) d -> b t n_s (k d)', k=self.packing_factor, n_s=self.n_s
-        )
+        # --- 1) Project spatial tokens to model dimension
         spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_s, d_model)
 
         # --- 2) Encode actions to d_model
@@ -707,6 +702,15 @@ def test_dynamics():
     fake_actions = jnp.ones((B, T), dtype=jnp.int32)
     fake_signal_idx = jnp.ones((B, T), dtype=jnp.int32)
     fake_step_idx = jnp.ones((B, T), dtype=jnp.int32)
+    def pack_bottleneck_to_spatial(z_btLd, *, n_s: int, k: int):
+        """
+        (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
+        Requires: N_b == n_s * k  (e.g., 512 -> 256 with k=2).
+        """
+        return rearrange(z_btLd, 'b t (n_s k) d -> b t n_s (k d)', n_s=n_s, k=k)
+    fake_packed_enc_tokens = pack_bottleneck_to_spatial(fake_enc_z, n_s=256, k=2)
+
+
     # need some way to assert that 512 * 16 == 256 * 32
     dynamics_kwargs = {
         "d_model": 128,
@@ -722,12 +726,12 @@ def test_dynamics():
     dynamics = Dynamics(**dynamics_kwargs)
     dynamics_vars = dynamics.init(
         {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_enc_z,
+        fake_packed_enc_tokens,
         fake_actions,
         fake_signal_idx,
         fake_step_idx,
     )
-    out = dynamics.apply(dynamics_vars, fake_enc_z, fake_actions, fake_signal_idx, fake_step_idx,
+    out = dynamics.apply(dynamics_vars, fake_packed_enc_tokens, fake_actions, fake_signal_idx, fake_step_idx,
                         rngs={"dropout": jax.random.PRNGKey(2)},
                         deterministic=True)
 if __name__ == "__main__":  

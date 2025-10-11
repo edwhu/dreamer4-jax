@@ -27,8 +27,9 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] setup architecture
         - [x] need to generalize tokenizer preprocessing logic
     - [ ] training loop
-        - [ ] data loading, need to import an encoder and forward the data.
+        - [x] data loading, need to import an encoder and forward the data.
         - [ ] shortcut loss function 
+        - [ ] proper checkpointing and loading encoder weights
 - [ ] Imagination training 
     - [ ] Behavior cloning and reward model
     - [ ] RL Training
