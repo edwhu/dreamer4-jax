@@ -85,8 +85,8 @@ def init_models(rng, encoder, dynamics, patch_tokens, B, T, enc_n_latents, enc_d
 @partial(
     jax.jit,
     static_argnames=(
-        "encoder","dynamics","tx","patch","H","W","C",
-        "n_s","k_max","normalize_loss","packing_factor",
+        "encoder","dynamics","tx","patch",
+        "n_s","k_max","packing_factor",
     ),
 )
 def train_step(
@@ -95,9 +95,8 @@ def train_step(
     enc_vars, dynamics_vars,
     frames, actions,
     *,
-    patch, H, W, C,
+    patch,
     n_s: int, k_max: int, packing_factor: int,
-    normalize_loss: bool = True,
     master_key: jnp.ndarray, step: int,
 ):
     # ---------- precompute (param-free) ----------
@@ -190,6 +189,152 @@ def train_step(
     return new_params, opt_state, new_dynamics_vars, aux_out
 
 
+
+@partial(jax.jit, static_argnames=("shape_bt","k_max",))
+def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
+    """Given per-element step_idx (e = log2 K), sample tau uniformly on that step's grid."""
+    B, T = shape_bt
+    rng_tau = rng
+    K = (1 << step_idx)                             # (B,T)
+    u = jax.random.uniform(rng_tau, (B, T), dtype=dtype)
+    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)   # 0..K-1
+    tau = j_idx.astype(dtype) / K.astype(dtype)                 # (B,T)
+    tau_idx = j_idx * (k_max // K)                              # global grid index
+    return tau, tau_idx
+
+@partial(jax.jit, static_argnames=("shape_bt","k_max",))
+def _sample_step_excluding_dmin(rng, shape_bt, k_max:int):
+    """Sample step exponents e in [0, emax) (exclude d_min), return (d, step_idx)."""
+    B, T = shape_bt
+    emax = jnp.log2(k_max).astype(jnp.int32)
+    step_idx = jax.random.randint(rng, (B, T), 0, emax, dtype=jnp.int32)  # exclude emax
+    d = 1.0 / (1 << step_idx).astype(jnp.float32)
+    return d, step_idx
+
+def _pack_bottleneck_to_spatial(z_btLd, *, n_s:int, k:int):
+    return rearrange(z_btLd, 'b t (n_s k) d -> b t n_s (k d)', n_s=n_s, k=k)
+
+
+@partial(
+    jax.jit,
+    static_argnames=("encoder","dynamics","tx","patch",
+                     "n_s","k_max","packing_factor"),
+)
+def train_step_efficient(
+    encoder, dynamics, tx,
+    params, opt_state,
+    enc_vars, dynamics_vars,
+    frames, actions,
+    *,
+    patch,
+    n_s:int, k_max:int, packing_factor:int,
+    k_self: float = 0.25,
+    master_key: jnp.ndarray, step: int,
+):
+    # ----- param-free precompute -----
+    patches_btnd = temporal_patchify(frames, patch)
+    step_key  = jax.random.fold_in(master_key, step)
+    enc_key, key_emp_tau, key_self_step, key_self_tau, key_noise_emp, key_noise_self, drop_key = jax.random.split(step_key, 7)
+
+    # frozen encoder
+    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
+    B, T, _, _ = z_btLd.shape
+    z1 = _pack_bottleneck_to_spatial(z_btLd, n_s=n_s, k=packing_factor)
+
+    # deterministic batch split (assume both parts are non-empty)
+    B_self = jnp.int32(jnp.round(k_self * B))
+    B_emp  = B - B_self
+
+    acts_full = jnp.concatenate([jnp.zeros((B,1), dtype=actions.dtype), actions], axis=1)
+    emax = jnp.log2(k_max).astype(jnp.int32)
+
+    # empirical indices (d_min)
+    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
+    tau_emp, tau_idx_emp = _sample_tau_for_step(key_emp_tau, (B_emp, T), k_max, step_idx_emp)
+
+    # self indices (d > d_min)
+    d_self, step_idx_self = _sample_step_excluding_dmin(key_self_step, (B_self, T), k_max)
+    tau_self, tau_idx_self = _sample_tau_for_step(key_self_tau, (B_self, T), k_max, step_idx_self)
+
+    # corruption
+    z0_emp  = jax.random.normal(key_noise_emp,  z1[:B_emp].shape,  dtype=z1.dtype)
+    zt_emp  = (1 - tau_emp)[...,None,None]  * z0_emp  + tau_emp[...,None,None]  * z1[:B_emp]
+    z0_self = jax.random.normal(key_noise_self, z1[B_emp:].shape, dtype=z1.dtype)
+    zt_self = (1 - tau_self)[...,None,None] * z0_self + tau_self[...,None,None] * z1[B_emp:]
+
+    # ramp weights
+    ramp_emp  = 0.9 * tau_emp  + 0.1
+    ramp_self = 0.9 * tau_self + 0.1
+
+    # fuse MAIN pass inputs
+    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
+    tau_idx_full  = jnp.concatenate([tau_idx_emp,  tau_idx_self],  axis=0)   # (B,T)
+    zt_full       = jnp.concatenate([zt_emp,       zt_self],       axis=0)   # (B,T,Sz,Dz)
+
+    # self half-step metadata
+    half_d        = d_self / 2.0
+    half_sid      = jnp.clip(step_idx_self + 1, 0, emax)
+    tau_next      = tau_self + half_d
+    half_tadd     = (k_max * half_d).astype(jnp.int32)
+    tau_idx_next  = tau_idx_self + half_tadd
+
+    def loss_and_aux(p):
+        dyn_vars = _with_params(dynamics_vars, p)
+
+        # ONE fused main forward (emp + self)
+        z1_hat_full = dynamics.apply(
+            dyn_vars, acts_full, step_idx_full, tau_idx_full, zt_full,
+            rngs={"dropout": drop_key}, deterministic=False,
+        )  # (B,T,Sz,Dz)
+
+        # split outputs
+        z1_hat_emp  = z1_hat_full[:B_emp]
+        z1_hat_self = z1_hat_full[B_emp:]
+
+        # empirical (flow) loss
+        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))       # (B_emp,T)
+        loss_emp = jnp.mean(flow_per * ramp_emp)
+
+        # self-consistency: two extra passes only for self rows
+        # half 1
+        z1_hat_half1 = dynamics.apply(
+            dyn_vars, acts_full[B_emp:], half_sid, tau_idx_self, zt_self,
+            rngs={"dropout": drop_key}, deterministic=False,
+        )
+        b1 = (z1_hat_half1 - zt_self) / (1.0 - tau_self)[...,None,None]
+        z_mid = zt_self + b1 * half_d[...,None,None]
+        # half 2
+        z1_hat_half2 = dynamics.apply(
+            dyn_vars, acts_full[B_emp:], half_sid, tau_idx_next, z_mid,
+            rngs={"dropout": drop_key}, deterministic=False,
+        )
+        b2 = (z1_hat_half2 - z_mid) / (1.0 - tau_next)[...,None,None]
+
+        b_tgt  = jax.lax.stop_gradient((b1 + b2) / 2.0)
+        b_pred = (z1_hat_self - zt_self) / (1.0 - tau_self)[...,None,None]
+        boot_per = (1.0 - tau_self)**2 * jnp.mean((b_pred - b_tgt)**2, axis=(2,3))
+        loss_self = jnp.mean(boot_per * ramp_self)
+
+        # combine (row-weighted)
+        loss = ((loss_emp * B_emp) + (loss_self * B_self)) / B
+
+        aux = {
+            "loss": loss,
+            "flow_loss": jnp.mean(flow_per),
+            "bootstrap_loss": jnp.mean(boot_per),
+            "weighted_flow_loss": loss_emp,
+            "weighted_bootstrap_loss": loss_self,
+            "frac_self": jnp.float32(B_self) / jnp.float32(B),
+        }
+        return loss, aux
+
+    (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
+    updates, opt_state = tx.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    new_vars = _with_params(dynamics_vars, new_params)
+    return new_params, opt_state, new_vars, aux
+
+
 if __name__ == "__main__":
     log_dir = Path("./logs")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -252,8 +397,9 @@ if __name__ == "__main__":
     # ---------- ORBAX: manager + (optional) restore ----------
     ckpt_dir = run_dir / "checkpoints"
     mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=10_000)
-
-    for step in range(max_steps):
+    from collections import deque
+    running_time_avg = deque(maxlen=5)
+    for step in range(10):
         data_start_t = time()
         rng, (frames, actions) = next_batch(rng)
         data_t = time() - data_start_t
@@ -261,7 +407,9 @@ if __name__ == "__main__":
         rng, master_key = jax.random.split(rng)
         params, opt_state, dynamics_vars, aux = train_step(
             encoder, dynamics, tx, params, opt_state, enc_vars, dynamics_vars, frames, actions,
-            patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, packing_factor=packing_factor, n_s=n_s, k_max=k_max,
+            patch=patch, master_key=master_key, step=step, packing_factor=packing_factor, n_s=n_s, k_max=k_max,
         )
         train_t = time() - train_start_t
-        break
+        print(f"Step {step} took {train_t} seconds")
+        running_time_avg.append(train_t)
+        print(f"Running time average: {sum(running_time_avg) / len(running_time_avg)} seconds")
