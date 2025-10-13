@@ -605,12 +605,7 @@ class Dynamics(nn.Module):
         )
 
         # --- 4) Shortcut embeddings (discrete lookup)
-        # Embed and add a singleton token dimension:
-        # convert the step value (1/2^x) to an index
-        # step_idx = jnp.log2(steps).astype(jnp.int32)
         step_tok   = self.step_embed(step_idxs)[:, :, None, :]      # (B, T, 1, d_model)
-        # signal will be some fraction a/b, need to express it as x/256 where x is an integer.
-        # signal_idx = jnp.round(signals * 256).astype(jnp.int32)
         signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order

@@ -190,7 +190,6 @@ def train_step(
     return new_params, opt_state, new_dynamics_vars, aux_out
 
 
-
 if __name__ == "__main__":
     log_dir = Path("./logs")
     log_dir.mkdir(parents=True, exist_ok=True)
