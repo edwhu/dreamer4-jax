@@ -33,8 +33,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [ ] training loop
         - [x] data loading, need to import an encoder and forward the data.
         - [x] shortcut loss function 
-        - [ ] visualization of predictions
-            - [ ] implement a fixed size context window that rolls as we generate new frames.
+        - [x] visualization of predictions
         - [x] optimized loss function 
         - [ ] proper checkpointing and loading encoder weights
 - [ ] Imagination training 

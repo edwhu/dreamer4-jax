@@ -6,7 +6,7 @@ from models import Encoder, Decoder, Dynamics
 from data import make_iterator
 from pathlib import Path
 from time import time
-from utils import pack_mae_params, temporal_patchify, make_state, make_manager, try_restore, maybe_save, with_params
+from utils import pack_mae_params, temporal_patchify, make_state, make_manager, try_restore, maybe_save, with_params, pack_bottleneck_to_spatial
 from einops import rearrange
 import orbax.checkpoint as ocp
 
@@ -42,14 +42,6 @@ def sample_shortcut_indices(rng, shape_bt, k_max: int, *, dtype=jnp.float32):
     tau_idx = j_idx * (k_max // K)                   # (B,T) int32 in [0, k_max-1]
 
     return d, tau, step_idx, tau_idx
-
-def pack_bottleneck_to_spatial(z_btLd, *, n_s: int, k: int):
-    """
-    (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
-    Requires: N_b == n_s * k  (e.g., 512 -> 256 with k=2).
-    """
-    return rearrange(z_btLd, 'b t (n_s k) d -> b t n_s (k d)', n_s=n_s, k=k)
-
 
 def init_models(rng, encoder, dynamics, patch_tokens, B, T, enc_n_latents, enc_d_bottleneck, packing_factor, num_spatial_tokens):
     rng, params_rng, mae_rng, dropout_rng = jax.random.split(rng, 4)
@@ -442,12 +434,6 @@ if __name__ == "__main__":
     size_max = 14 # maximum size of the square
     hold_min = 4 # how long the agent holds a direction for
     hold_max = 9 # how long the agent holds a direction for
-
-    patch = 4
-    num_patches = (H // patch) * (W // patch)
-    D_patch = patch * patch * C
-    k_max = 256
-
 
     patch = 4
     num_patches = (H // patch) * (W // patch)
