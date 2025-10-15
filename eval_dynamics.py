@@ -126,13 +126,80 @@ def make_dynamics_meta(
         "tokenizer_ckpt_dir": tokenizer_ckpt_dir,
     }
 
-@partial(jax.jit, static_argnames=("dynamics", "batch_size", "ctx_length", "num_sampling_steps", "enc_d_bottleneck", "n_s", "packing_factor", "k_max"))
-def predict_one_step(
+def dynamics_predict_one_step(
     dynamics: Dynamics,
     dynamics_vars: dict,
-    z_bottleneck_ctx: jax.Array,
-    actions_ctx: jax.Array,
-    actions_curr: jax.Array,
+    z_ctx: jax.Array,            # (B, T_ctx, N_s, D_s)
+    actions_ctx: jax.Array,      # (B, T_ctx, D_a)
+    actions_curr: jax.Array,     # (B, 1,     D_a)
+    batch_size: int,
+    ctx_length: int,
+    num_sampling_steps: int,
+    k_max: int,
+    rng: jax.random.PRNGKey,
+) -> jax.Array:
+    # RNG
+    rng, ctx_noise_rng, curr_noise_rng, sampling_rng = jax.random.split(rng, 4)
+
+    # --- Noise using existing tensor shapes (no dynamic ints) ---
+    # z_ctx already has the right target shape (B, T_ctx, N_s, D_s)
+    z_ctx = z_ctx + 0.1 * jax.random.normal(ctx_noise_rng, z_ctx.shape, dtype=z_ctx.dtype)
+
+    # Fresh slot for current step: use slice shape to avoid ints
+    z0 = jax.random.normal(curr_noise_rng, z_ctx[:, :1, :, :].shape, dtype=z_ctx.dtype)
+    z_curr = jnp.concatenate([z_ctx, z0], axis=1)  # (B, T_ctx+1, N_s, D_s)
+
+    # Actions concat (shapes are already fixed)
+    actions = jnp.concatenate([actions_ctx, actions_curr], axis=1)  # (B, T_ctx+1, D_a)
+
+    # Schedule (constants; shapes depend only on T_total = ctx_length+1 but that’s static per call)
+    B = batch_size
+    T_total = ctx_length + 1
+    d = jnp.reciprocal(jnp.asarray(num_sampling_steps, dtype=jnp.float32))
+    step_value = jnp.full((B, T_total), d, dtype=jnp.float32)
+    step_idx_scalar = jnp.round(jnp.log2(jnp.asarray(num_sampling_steps, jnp.float32))).astype(jnp.int32)
+    step_idx = jnp.full((B, T_total), step_idx_scalar, dtype=jnp.int32)
+    signal_value = jnp.zeros((B, T_total), dtype=jnp.float32)
+    signal_idx   = jnp.zeros((B, T_total), dtype=jnp.int32)
+
+    def sample_step(carry, n):
+        z_curr, signal_idx, signal_value = carry
+        drop_rng = jax.random.fold_in(sampling_rng, n)
+
+        flow = dynamics.apply(
+            dynamics_vars,
+            actions,
+            step_idx,
+            signal_idx,
+            z_curr,
+            rngs={"dropout": drop_rng},
+            deterministic=True,
+        )
+        z_curr = z_curr + flow * step_value[..., None, None]
+        signal_value = signal_value + step_value
+        new_signal_idx = jnp.floor(signal_value * jnp.asarray(k_max, jnp.float32)).astype(jnp.int32)
+        new_signal_idx = jnp.clip(new_signal_idx, 0, k_max - 1)
+        return (z_curr, new_signal_idx, signal_value), None
+
+    (final_state, _) = jax.lax.scan(
+        sample_step,
+        (z_curr, signal_idx, signal_value),
+        jnp.arange(num_sampling_steps),
+    )
+    final_z_curr, _, _ = final_state
+    return final_z_curr  # (B, T_ctx+1, N_s, D_s)
+
+@partial(
+    jax.jit,
+    static_argnames=("dynamics","batch_size","ctx_length","num_sampling_steps",
+                     "enc_d_bottleneck","n_s","packing_factor","k_max")
+)
+def dynamics_predict_multiple_steps(
+    dynamics: Dynamics,
+    dynamics_vars: dict,
+    z_ctx: jax.Array,           # (B, T_ctx, N_s, D_s)
+    actions_ctx: jax.Array,     # (B, T_ctx, D_a)
+    actions_curr: jax.Array,    # (B, T_pred, D_a)  <-- note T_pred here
     batch_size: int,
     ctx_length: int,
     num_sampling_steps: int,
@@ -143,93 +210,49 @@ def predict_one_step(
     rng: jax.random.PRNGKey,
 ) -> jax.Array:
     """
-    Denoise the current frame's spatial tokens given context latents+actions.
-
-    Args:
-        dynamics:        Flax module (used via .apply)
-        dynamics_vars:   Variables/params for `dynamics`
-        z_bottleneck_ctx: (B, T_ctx, N_latents, D_b)
-        actions_ctx:      (B, T_ctx, D_a)
-        actions_curr:     (B, 1,     D_a)
-        batch_size:       B (static for JIT)
-        ctx_length:       T_ctx (static for JIT)
-        num_sampling_steps: K diffusion steps; step size d = 1/K (static)
-        n_s:              number of spatial tokens after packing (static)
-        packing_factor:   spatial packing factor; D_s = D_b * packing_factor (static)
-        k_max:            discretization for tau index in [0, k_max-1] (static)
-        rng:              PRNGKey
-
     Returns:
-        final_z_curr: (B, T_ctx+1, N_s, D_s)
+      pred_z_ctx: (B, T_pred, N_s, D_s)  the sequence of predicted frames (no context)
     """
-    # ---- RNG keys ----
-    rng, ctx_noise_rng, curr_noise_rng, sampling_rng = jax.random.split(rng, 4)
+    actions_steps = jnp.swapaxes(actions_curr, 0, 1)       # (T_pred, B)
 
-    # ---- Pack context latents to spatial tokens & lightly noise ----
-    # z_ctx: (B, T_ctx, N_s, D_s)
-    z_ctx = pack_bottleneck_to_spatial(z_bottleneck_ctx, n_s=n_s, k=packing_factor)
-    z_ctx = z_ctx + 0.1 * jax.random.normal(ctx_noise_rng, (batch_size, ctx_length, n_s, enc_d_bottleneck * packing_factor), dtype=z_ctx.dtype)
+    def _predict_one_step(carry, action_t):  # action_t: (B, 1)
+        z_ctx_curr, actions_ctx_curr, rng_curr = carry
+        rng_curr, step_rng = jax.random.split(rng_curr)
 
-    # Add a fresh noisy slot for current timestep
-    B = batch_size
-    T_total = ctx_length + 1
-    _, _, N_s, D_s = z_ctx.shape
-    z0 = jax.random.normal(curr_noise_rng, (B, 1, N_s, D_s), dtype=z_ctx.dtype)
-    z_curr = jnp.concatenate([z_ctx, z0], axis=1)  # (B, T_ctx+1, N_s, D_s)
+        # One-step prediction using current context + this step's action
+        new_z_ctx = dynamics_predict_one_step(
+            dynamics=dynamics,
+            dynamics_vars=dynamics_vars,
+            z_ctx=z_ctx_curr,
+            actions_ctx=actions_ctx_curr,
+            actions_curr=action_t,                     # (B, 1, D_a)
+            batch_size=batch_size,
+            ctx_length=z_ctx_curr.shape[1],            # use tensor shape, not an int carry
+            num_sampling_steps=num_sampling_steps,
+            enc_d_bottleneck=enc_d_bottleneck,
+            n_s=n_s,
+            packing_factor=packing_factor,
+            k_max=k_max,
+            rng=step_rng,
+        )  # (B, T_ctx+1, N_s, D_s)
 
-    # ---- Actions concat: (B, T_ctx+1, D_a) ----
-    actions = jnp.concatenate([actions_ctx, actions_curr], axis=1)
+        # Append new action to action context (shape-stable)
+        new_actions_ctx = jnp.concatenate([actions_ctx_curr, action_t], axis=1)  # (B, T_ctx+1, D_a)
+        # slice action and z contexts back to ctx_length, keeping the most recent items.
+        new_z_ctx = new_z_ctx[:, -ctx_length:, :, :]
+        new_actions_ctx = new_actions_ctx[:, -ctx_length:]
 
-    # ---- Schedule tensors (constant over T) ----
-    # Step size d = 1/K (float32)
-    d = jnp.reciprocal(jnp.asarray(num_sampling_steps, dtype=jnp.float32))
-    step_value = jnp.full((B, T_total), d, dtype=jnp.float32)
+        # Last predicted frame for this step (per-step y): (B, N_s, D_s)
+        newest_frame = new_z_ctx[:, -1, :, :]
 
-    # Step index e = log2(K) as int32, broadcast to (B, T_total)
-    step_idx_scalar = jnp.round(jnp.log2(jnp.asarray(num_sampling_steps, dtype=jnp.float32)))
-    step_idx_scalar = step_idx_scalar.astype(jnp.int32)
-    step_idx = jnp.full((B, T_total), step_idx_scalar, dtype=jnp.int32)
+        new_carry = (new_z_ctx, new_actions_ctx, rng_curr)
+        return new_carry, newest_frame
 
-    # Signal level τ starts at 0 everywhere
-    signal_value = jnp.zeros((B, T_total), dtype=jnp.float32)
-    signal_idx   = jnp.zeros((B, T_total), dtype=jnp.int32)
-
-    # ---- One diffusion step (scanned K times) ----
-    def sample_step(carry, n):
-        """Single Euler diffusion step."""
-        z_curr, signal_idx, signal_value = carry
-
-        # Per-step dropout key
-        drop_rng = jax.random.fold_in(sampling_rng, n)
-
-        # Dynamics forward
-        flow = dynamics.apply(
-            dynamics_vars,
-            actions,                # (B, T, D_a)
-            step_idx,               # (B, T)
-            signal_idx,             # (B, T)
-            z_curr,                 # (B, T, N_s, D_s)
-            rngs={"dropout": drop_rng},
-            deterministic=True,
-        )
-
-        # Euler update: z <- z + flow * d
-        z_curr = z_curr + flow * step_value[..., None, None]
-
-        # τ <- τ + d; idx = floor(τ * k_max), clipped
-        signal_value = signal_value + step_value
-        new_signal_idx = jnp.floor(signal_value * jnp.asarray(k_max, jnp.float32)).astype(jnp.int32)
-        new_signal_idx = jnp.clip(new_signal_idx, 0, k_max - 1)
-
-        return (z_curr, new_signal_idx, signal_value), None
-
-    (final_state, _) = jax.lax.scan(
-        sample_step,
-        (z_curr, signal_idx, signal_value),
-        jnp.arange(num_sampling_steps),
-    )
-    final_z_curr, _, _ = final_state
-    return final_z_curr
+    init_carry = (z_ctx, actions_ctx, rng)
+    (final_carry, newest_frames) = jax.lax.scan(_predict_one_step, init_carry, actions_steps)
+    # newest_frames: (T_pred, B, N_s, D_s) -> (B, T_pred, N_s, D_s)
+    pred_z = jnp.swapaxes(newest_frames, 0, 1)
+    return pred_z
 
 if __name__ == "__main__":
     log_dir = Path("./logs"); log_dir.mkdir(parents=True, exist_ok=True)
@@ -333,32 +356,33 @@ if __name__ == "__main__":
     # ====== (C) Visualize the loaded dynamics policy ======
     try:
         ctx_length = 8
+        pred_length = 4
         fake_z_bottleneck_ctx = jnp.zeros((B, ctx_length, enc_n_latents, enc_d_bottleneck), dtype=jnp.float32)
+        fake_z_ctx = pack_bottleneck_to_spatial(fake_z_bottleneck_ctx, n_s=n_s, k=packing_factor)
         fake_actions_ctx = jnp.zeros((B, ctx_length), dtype=jnp.int32)
-        fake_actions_curr = jnp.zeros((B, 1), dtype=jnp.int32)
+        fake_actions_curr = jnp.zeros((B, pred_length, 1), dtype=jnp.int32)
         num_sampling_steps = 4
         sampling_rng, rng = jax.random.split(rng)
-
-        one_step_kwargs = {
-            "dynamics": dynamics,
-            "dynamics_vars": dynamics_vars,
-            "z_bottleneck_ctx": fake_z_bottleneck_ctx,
-            "actions_ctx": fake_actions_ctx,
-            "actions_curr": fake_actions_curr,
-            "batch_size": B,
-            "ctx_length": ctx_length,
-            "num_sampling_steps": num_sampling_steps,
-            "enc_d_bottleneck": enc_d_bottleneck,
-            "n_s": n_s,
-            "packing_factor": packing_factor,
-            "k_max": k_max,
-            "rng": sampling_rng
-        }
         for _ in range(10):
             start_time = time()
-            predict_one_step(**one_step_kwargs)
+            pred_z_ctx = dynamics_predict_multiple_steps(
+                dynamics,
+                dynamics_vars,
+                fake_z_ctx,
+                fake_actions_ctx,
+                fake_actions_curr,
+                B,
+                ctx_length,
+                num_sampling_steps,
+                enc_d_bottleneck,
+                n_s,
+                packing_factor,
+                k_max,
+                sampling_rng
+            )
             end_time = time()
             print(f"Time taken: {end_time - start_time} seconds")
+
         import ipdb; ipdb.set_trace()
     finally:
         mngr.wait_until_finished()
