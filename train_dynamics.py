@@ -18,6 +18,12 @@ import numpy as np
 import optax
 import imageio.v2 as imageio
 import orbax.checkpoint as ocp
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 from models import Encoder, Decoder, Dynamics
 from data import make_iterator
@@ -37,6 +43,18 @@ from sampler_unified import SamplerConfig, sample_video
 
 @dataclass(frozen=True)
 class RealismConfig:
+    # IO / ckpt
+    run_name: str
+    tokenizer_ckpt: str
+    log_dir: str = "./logs"
+    ckpt_max_to_keep: int = 2
+    ckpt_save_every: int = 10_000
+    
+    # wandb config
+    use_wandb: bool = False
+    wandb_entity: str | None = None  # if None, uses default entity
+    wandb_project: str | None = None  # if None, uses run_name as project
+
     # data
     B: int = 8
     T: int = 64
@@ -72,13 +90,6 @@ class RealismConfig:
     max_steps: int = 50_000
     log_every: int = 1_000
     lr: float = 3e-4
-
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    log_dir: str = "./logs"
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
@@ -653,9 +664,9 @@ def run_evaluation(
         
         dt = time.time() - t0
         HZ = sampler_conf.horizon
-        mse = jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2)
-        psnr = 10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12))
-        print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={float(mse):.6g} | PSNR={float(psnr):.2f} dB | {dt:.2f}s")
+        mse = float(jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2))
+        psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
+        print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
 
         # Build tiled video frames
         grid_frames = build_tiled_video_frames(
@@ -671,15 +682,45 @@ def run_evaluation(
         plan_path = tag_dir / f"{tag}_plan.json"
         
         save_evaluation_video(grid_frames, mp4_path, tag)
-        save_evaluation_plan(sampler_conf, step, float(mse), float(psnr), plan_path)
+        save_evaluation_plan(sampler_conf, step, mse, psnr, plan_path)
         
         print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
+        
+        # Log to wandb
+        if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+            # Log metrics
+            wandb.log({
+                f"eval/{tag}/mse": mse,
+                f"eval/{tag}/psnr": psnr,
+                f"eval/{tag}/horizon": HZ,
+                f"eval/{tag}/eval_time": dt,
+            }, step=step)
+            if grid_frames:
+                wandb.log({
+                    f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
+                }, step=step)
 
 # ---------------------------
 # Main
 # ---------------------------
 
 def run(cfg: RealismConfig):
+    # Initialize wandb if enabled
+    if cfg.use_wandb:
+        if not WANDB_AVAILABLE:
+            print("[warning] wandb requested but not installed. Install with: pip install wandb")
+            print("[warning] Continuing without wandb logging.")
+        else:
+            wandb_project = cfg.wandb_project or cfg.run_name
+            wandb.init(
+                entity=cfg.wandb_entity,
+                project=wandb_project,
+                name=cfg.run_name,
+                config=asdict(cfg),
+                dir=str(Path(cfg.log_dir).resolve()),
+            )
+            print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+    
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
     run_dir = _ensure_dir(root / cfg.run_name)
@@ -766,14 +807,29 @@ def run(cfg: RealismConfig):
 
         # Logging
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
+            flow_mse = float(aux['flow_mse'])
+            boot_mse = float(aux['bootstrap_mse'])
+            step_time = time.time() - train_step_start_time
+            total_time = time.time() - start_wall
+            
             pieces = [
                 f"[train] step={step:06d}",
-                f"flow_mse={float(aux['flow_mse']):.6g}",
-                f"boot_mse={float(aux['bootstrap_mse']):.6g}",
-                f"t={time.time()-train_step_start_time:.4f}s",
-                f"total_t={time.time()-start_wall:.1f}s",
+                f"flow_mse={flow_mse:.6g}",
+                f"boot_mse={boot_mse:.6g}",
+                f"t={step_time:.4f}s",
+                f"total_t={total_time:.1f}s",
             ]
             print(" | ".join(pieces))
+            
+            # Log to wandb
+            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({
+                    "train/flow_mse": flow_mse,
+                    "train/bootstrap_mse": boot_mse,
+                    "train/step_time": step_time,
+                    "train/total_time": total_time,
+                    "step": step,
+                }, step=step)
 
         # Save (async) when policy says we should
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
@@ -794,9 +850,20 @@ def run(cfg: RealismConfig):
 
     # Save final config
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
+    
+    # Finish wandb run
+    if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+        wandb.finish()
+        print("[wandb] Finished logging.")
 
 
 if __name__ == "__main__":
-    cfg = RealismConfig(run_name="realism_streaming_efficient", tokenizer_ckpt="/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints")
+    cfg = RealismConfig(
+        run_name="test_wandb_run_fixvideo", 
+        tokenizer_ckpt="/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints",
+        use_wandb=True,
+        wandb_entity="edhu",
+        wandb_project="tiny_dreamer_4",
+    )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
