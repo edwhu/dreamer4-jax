@@ -139,6 +139,10 @@ def make_iterator(
     size_max: int = 12,
     hold_min: int = 3,
     hold_max: int = 8,
+    fg_min_color: int = 0,
+    fg_max_color: int = 255,
+    bg_min_color: int = 0,
+    bg_max_color: int = 255,
 ):
     """
     Construct a JIT-friendly data iterator for stochastic action-conditioned videos.
@@ -159,6 +163,8 @@ def make_iterator(
         pixels_per_step: step size for each move
         size_min, size_max: range of square sizes
         hold_min, hold_max: range of commit durations
+        fg_min_color, fg_max_color: range of foreground colors
+        bg_min_color, bg_max_color: range of background colors
     """
     # Wrap renderer with static shape args
     gen = jax.jit(
@@ -249,11 +255,11 @@ def make_iterator(
         )
         init_bg = jax.random.randint(
             k_bg, (batch_size, channels),
-            0, 255, dtype=jnp.uint8,
+            bg_min_color, bg_max_color + 1, dtype=jnp.uint8,
         )
         init_fg = jax.random.randint(
             k_fg, (batch_size, channels),
-            0, 255, dtype=jnp.uint8,
+            fg_min_color, fg_max_color + 1, dtype=jnp.uint8,
         )
         sizes = jax.random.randint(
             k_size, (batch_size,),

@@ -343,7 +343,7 @@ if __name__ == "__main__":
     dynamics_kwargs = {
         "d_model": 128, "n_s": n_s, "d_spatial": enc_d_bottleneck * packing_factor,
         "d_bottleneck": enc_d_bottleneck, "k_max": k_max, "n_r": 10,
-        "n_heads": 4, "depth": 4, "dropout": 0.0
+        "n_heads": 4, "depth": 8, "dropout": 0.0
     }
 
     encoder = Encoder(**enc_kwargs)
@@ -400,8 +400,10 @@ if __name__ == "__main__":
 
     # ====== (C) Visualize the loaded dynamics policy ======
     try:
-        ctx_length = 4
-        num_sampling_steps = 32
+        data_rng = jax.random.PRNGKey(0)
+        _, (frames, actions) = next_batch(data_rng)
+        ctx_length = 32
+        num_sampling_steps = 4
         visualize_dynamics_kwargs = {
             "encoder": encoder,
             "decoder": decoder,

@@ -1,4 +1,5 @@
 logs/
+overfit_exps/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -574,7 +574,8 @@ class Dynamics(nn.Module):
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         self.signal_embed = nn.Embed(self.k_max + 1, self.d_model, name="signal_embed")
-        self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head")
+        self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head", kernel_init=nn.initializers.zeros,
+                            bias_init=nn.initializers.zeros)  # zero-init
 
     @nn.compact
     def __call__(self,actions, step_idxs, signal_idxs, packed_enc_tokens, *, deterministic: bool = True):
@@ -619,6 +620,11 @@ class Dynamics(nn.Module):
         spatial_tokens = x[:, :, self.spatial_slice, :]
         readout = self.flow_x_head(spatial_tokens)
         return readout
+
+        # in Dynamics.__call__(), after `spatial_tokens = x[:, :, self.spatial_slice, :]`
+        # delta = self.flow_x_head(spatial_tokens)           # (B,T,n_s,d_spatial)
+        # x1_hat = packed_enc_tokens + delta                 # residual prediction (copy at init)
+        # return x1_hat
 
 def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)
