@@ -1,5 +1,5 @@
-# train_realism_efficient.py
-# Streaming-batch "realism" training on synthetic data with TF training and AR evaluation.
+# train_dynamics.py
+# Streaming-batch training on synthetic data with teacher-forced training and autoregressive evaluation.
 # This version keeps ONLY the efficient training step and adds robust Orbax checkpointing.
 # It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
@@ -22,7 +22,7 @@ import orbax.checkpoint as ocp
 from models import Encoder, Decoder, Dynamics
 from data import make_iterator
 from utils import (
-    temporal_patchify, temporal_unpatchify,
+    temporal_patchify,
     pack_bottleneck_to_spatial,
     with_params,
     make_state, make_manager, try_restore, maybe_save,
@@ -30,6 +30,58 @@ from utils import (
 )
 
 from sampler_unified import SamplerConfig, sample_video
+
+# ---------------------------
+# Config
+# ---------------------------
+
+@dataclass(frozen=True)
+class RealismConfig:
+    # data
+    B: int = 8
+    T: int = 64
+    H: int = 32
+    W: int = 32
+    C: int = 3
+    pixels_per_step: int = 2
+    size_min: int = 6
+    size_max: int = 14
+    hold_min: int = 4
+    hold_max: int = 9
+    diversify_data: bool = True
+
+    # tokenizer / dynamics sizes
+    patch: int = 4
+    enc_n_latents: int = 16
+    enc_d_bottleneck: int = 32
+    d_model_enc: int = 64
+    d_model_dyn: int = 128
+    enc_depth: int = 8
+    dec_depth: int = 8
+    dyn_depth: int = 6
+    n_heads: int = 4
+    packing_factor: int = 2
+    n_r: int = 4 # number of register tokens for dynamics
+
+    # schedule
+    k_max: int = 8
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
+
+    # train
+    max_steps: int = 50_000
+    log_every: int = 1_000
+    lr: float = 3e-4
+
+    # IO / ckpt
+    run_name: str
+    tokenizer_ckpt: str
+    log_dir: str = "./logs"
+    ckpt_max_to_keep: int = 2
+    ckpt_save_every: int = 10_000
+
+    # eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
 # ---------------------------
 # Small helpers
@@ -45,9 +97,9 @@ def _to_uint8(img_f32):
 def _stack_wide(*imgs_hwC):
     return np.concatenate(imgs_hwC, axis=1)
 
-def _tile_triptychs(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
+def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
     if len(trip_list_hwC) == 0:
-        raise ValueError("Empty triptych list")
+        raise ValueError("Empty video list")
     H, W3, C = trip_list_hwC[0].shape
     B = len(trip_list_hwC)
     nrows = math.ceil(B / ncols)
@@ -281,7 +333,7 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int) -> list[tuple[str, Sample
     regs.append(("shortcut_d4_pure_AR", SamplerConfig(schedule="shortcut", d=1/4, **common)))
     return regs
 
-def _plan_from_sconf(s: SamplerConfig) -> Dict[str, Any]:
+def _plan_from_sampler_conf(s: SamplerConfig) -> Dict[str, Any]:
     def _is_pow2_frac(x: float) -> bool:
         if x <= 0 or x > 1: return False
         inv = round(1.0 / x)
@@ -316,56 +368,97 @@ def _plan_from_sconf(s: SamplerConfig) -> Dict[str, Any]:
     )
 
 # ---------------------------
-# Config
+# Video building and saving utilities
 # ---------------------------
 
-@dataclass(frozen=True)
-class RealismConfig:
-    # data
-    B: int = 8
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
+def build_tiled_video_frames(
+    gt_frames: jnp.ndarray,
+    floor_frames: jnp.ndarray,
+    pred_frames: jnp.ndarray,
+    batch_size: int,
+) -> list[np.ndarray]:
+    """
+    Build tiled video frames from ground truth, floor, and prediction frames.
+    
+    Each frame in the output contains a grid of triplets (GT | Floor | Pred) stacked horizontally,
+    with multiple batch items tiled vertically/horizontally.
+    
+    Args:
+        gt_frames: Ground truth frames (B, T, H, W, C)
+        floor_frames: Floor/reference frames (B, T, H, W, C)
+        pred_frames: Predicted frames (B, T, H, W, C)
+        batch_size: Batch size B
+        
+    Returns:
+        List of grid frames, one per time step
+    """
+    gt_np_all = _to_uint8(gt_frames)
+    floor_np_all = _to_uint8(floor_frames)
+    pred_np_all = _to_uint8(pred_frames)
+    
+    T_total = gt_np_all.shape[1]
+    ncols = 1 if batch_size <= 2 else min(2, batch_size)
+    grid_frames = []
+    
+    for t_idx in range(T_total):
+        trip_list = [
+            _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
+            for b in range(batch_size)
+        ]
+        grid_img = _tile_videos(trip_list, ncols=ncols, pad_color=0)
+        grid_frames.append(grid_img)
+    
+    return grid_frames
 
-    # tokenizer / dynamics sizes
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 6
-    n_heads: int = 4
-    packing_factor: int = 2
-    n_r: int = 4
+def save_evaluation_video(
+    grid_frames: list[np.ndarray],
+    output_path: Path,
+    tag: str,
+) -> bool:
+    """
+    Save grid frames as an MP4 video file.
+    
+    Args:
+        grid_frames: List of grid frames to write
+        output_path: Path where MP4 should be saved
+        tag: Tag for error messages
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        with imageio.get_writer(output_path, fps=25, codec="libx264", quality=8) as w:
+            for fr in grid_frames:
+                w.append_data(fr)
+        return True
+    except Exception as e:
+        print(f"[eval:{tag}] MP4 write skipped ({e})")
+        return False
 
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 50_000
-    log_every: int = 1_000
-    lr: float = 3e-4
-
-    # IO / ckpt
-    run_name: str = "realism_streaming_efficient"
-    tokenizer_ckpt: str = "/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints"
-    log_dir: str = "./logs"
-    ckpt_max_to_keep: int = 5
-    ckpt_save_every: int = 5_000
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+def save_evaluation_plan(
+    sampler_conf: SamplerConfig,
+    step: int,
+    mse: float,
+    psnr: float,
+    output_path: Path,
+):
+    """
+    Save evaluation plan/metadata as JSON.
+    
+    Args:
+        sampler_conf: Sampler configuration
+        step: Training step number
+        mse: Mean squared error
+        psnr: Peak signal-to-noise ratio in dB
+        output_path: Path where JSON should be saved
+    """
+    plan = _plan_from_sampler_conf(sampler_conf)
+    plan["step"] = int(step)
+    plan["mse"] = float(mse)
+    plan["psnr_db"] = float(psnr)
+    
+    with open(output_path, "w") as f:
+        json.dump(plan, f, indent=2)
 
 # ---------------------------
 # Meta for dynamics checkpoints
@@ -397,33 +490,41 @@ def make_dynamics_meta(
     }
 
 # ---------------------------
-# Main
+# Training state dataclass
 # ---------------------------
 
-def run(cfg: RealismConfig):
-    # Output dirs
-    root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
-    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
-    vis_dir = _ensure_dir(run_dir / "viz")
-    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+@dataclass
+class TrainState:
+    """Container for all training-related state (models, variables, optimizer, etc.)."""
+    encoder: Encoder
+    decoder: Decoder
+    dynamics: Dynamics
+    enc_vars: dict
+    dec_vars: dict
+    dyn_vars: dict
+    params: dict
+    enc_kwargs: dict
+    dec_kwargs: dict
+    dyn_kwargs: dict
+    tx: optax.Transform
+    opt_state: optax.OptState
+    mae_eval_key: jnp.ndarray
 
-    # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+# ---------------------------
+# Model initialization
+# ---------------------------
 
-    # One batch to shape/init models & tokenizer restore
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init) = next_batch(init_rng)
-
+def initialize_models_and_tokenizer(
+    cfg: RealismConfig,
+    frames_init: jnp.ndarray,
+    actions_init: jnp.ndarray,
+) -> TrainState:
+    """
+    Initialize encoder, decoder, dynamics models and restore tokenizer.
+    
+    Returns:
+        TrainState containing all initialized models, variables, and optimizer state.
+    """
     patch = cfg.patch
     num_patches = (cfg.H // patch) * (cfg.W // patch)
     D_patch = patch * patch * cfg.C
@@ -450,7 +551,7 @@ def run(cfg: RealismConfig):
         dropout=0.0,
         mlp_ratio=4.0, time_every=4, latents_only_time=True,
     )
-    n_s = cfg.enc_n_latents // cfg.packing_factor
+    n_s = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
         d_model=cfg.d_model_dyn,
         d_bottleneck=cfg.enc_d_bottleneck,
@@ -491,30 +592,148 @@ def run(cfg: RealismConfig):
 
     tx = optax.adam(cfg.lr)
     opt_state = tx.init(params)
+    
+    return TrainState(
+        encoder=encoder,
+        decoder=decoder,
+        dynamics=dynamics,
+        enc_vars=enc_vars,
+        dec_vars=dec_vars,
+        dyn_vars=dyn_vars,
+        params=params,
+        enc_kwargs=enc_kwargs,
+        dec_kwargs=dec_kwargs,
+        dyn_kwargs=dyn_kwargs,
+        tx=tx,
+        opt_state=opt_state,
+        mae_eval_key=mae_eval_key,
+    )
+
+# ---------------------------
+# Evaluation logic
+# ---------------------------
+
+def run_evaluation(
+    cfg: RealismConfig,
+    step: int,
+    train_state: TrainState,
+    next_batch,
+    vis_dir: Path,
+):
+    """
+    Run periodic evaluation: sample videos, compute metrics, and save visualization.
+    
+    Args:
+        cfg: Configuration object
+        step: Current training step
+        train_state: TrainState containing all models, variables, and optimizer state
+        next_batch: Data iterator function
+        vis_dir: Directory for visualization outputs
+    """
+    val_rng = jax.random.PRNGKey(9999)
+    _, (val_frames, val_actions) = next_batch(val_rng)
+    dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
+    ctx_length = min(32, cfg.T - 1)
+    regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
+
+    for tag, sampler_conf in regimes:
+        sampler_conf.mae_eval_key = train_state.mae_eval_key
+        sampler_conf.rng_key = jax.random.PRNGKey(4242)
+        t0 = time.time()
+        
+        pred_frames, floor_frames, gt_frames = sample_video(
+            encoder=train_state.encoder,
+            decoder=train_state.decoder,
+            dynamics=train_state.dynamics,
+            enc_vars=train_state.enc_vars,
+            dec_vars=train_state.dec_vars,
+            dyn_vars=dyn_vars_eval,
+            frames=val_frames, actions=val_actions, config=sampler_conf,
+        )
+        
+        dt = time.time() - t0
+        HZ = sampler_conf.horizon
+        mse = jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2)
+        psnr = 10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12))
+        print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={float(mse):.6g} | PSNR={float(psnr):.2f} dB | {dt:.2f}s")
+
+        # Build tiled video frames
+        grid_frames = build_tiled_video_frames(
+            gt_frames=gt_frames,
+            floor_frames=floor_frames,
+            pred_frames=pred_frames,
+            batch_size=cfg.B,
+        )
+
+        # Save video and plan
+        tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
+        mp4_path = tag_dir / f"{tag}_grid.mp4"
+        plan_path = tag_dir / f"{tag}_plan.json"
+        
+        save_evaluation_video(grid_frames, mp4_path, tag)
+        save_evaluation_plan(sampler_conf, step, float(mse), float(psnr), plan_path)
+        
+        print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def run(cfg: RealismConfig):
+    # Output dirs
+    root = _ensure_dir(Path(cfg.log_dir))
+    run_dir = _ensure_dir(root / cfg.run_name)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+
+    # Data iterator (streaming)
+    next_batch = make_iterator(
+        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
+        pixels_per_step=cfg.pixels_per_step,
+        size_min=cfg.size_min, size_max=cfg.size_max,
+        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
+        fg_min_color=0 if cfg.diversify_data else 128,
+        fg_max_color=255 if cfg.diversify_data else 128,
+        bg_min_color=0 if cfg.diversify_data else 255,
+        bg_max_color=255 if cfg.diversify_data else 255,
+    )
+
+    # Initialize models and restore tokenizer
+    init_rng = jax.random.PRNGKey(0)
+    _, (frames_init, actions_init) = next_batch(init_rng)
+    
+    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+    
+    # Extract some values for checkpointing
+    patch = cfg.patch
+    k_max = cfg.k_max
+    n_s = cfg.enc_n_latents // cfg.packing_factor
 
     # -------- Orbax manager & (optional) restore --------
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
     meta = make_dynamics_meta(
-        enc_kwargs=enc_kwargs,
-        dec_kwargs=dec_kwargs,
-        dynamics_kwargs=dyn_kwargs,
+        enc_kwargs=train_state.enc_kwargs,
+        dec_kwargs=train_state.dec_kwargs,
+        dynamics_kwargs=train_state.dyn_kwargs,
         H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
         k_max=k_max, packing_factor=cfg.packing_factor, n_s=n_s,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
     )
 
-    state_example = make_state(params, opt_state, rng, step=0)
+    rng = jax.random.PRNGKey(0)
+    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
     restored = try_restore(mngr, state_example, meta)
 
     start_step = 0
     if restored is not None:
         latest_step, r = restored
-        params     = r.state["params"]
-        opt_state  = r.state["opt_state"]
-        rng        = r.state["rng"]
+        train_state.params = r.state["params"]
+        train_state.opt_state = r.state["opt_state"]
+        rng = r.state["rng"]
         start_step = int(r.state["step"]) + 1
-        dyn_vars = with_params(dyn_vars, params)
+        train_state.dyn_vars = with_params(train_state.dyn_vars, train_state.params)
         print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
 
     # -------- Training loop --------
@@ -535,10 +754,10 @@ def run(cfg: RealismConfig):
         B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
 
         train_step_start_time = time.time()
-        params, opt_state, aux = train_step_efficient(
-            encoder, dynamics, tx,
-            params, opt_state,
-            enc_vars, dyn_vars,
+        train_state.params, train_state.opt_state, aux = train_step_efficient(
+            train_state.encoder, train_state.dynamics, train_state.tx,
+            train_state.params, train_state.opt_state,
+            train_state.enc_vars, train_state.dyn_vars,
             frames, actions,
             patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
             n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
@@ -557,65 +776,18 @@ def run(cfg: RealismConfig):
             print(" | ".join(pieces))
 
         # Save (async) when policy says we should
-        state = make_state(params, opt_state, train_rng, step)
+        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
         maybe_save(mngr, step, state, meta)
 
-        # Periodic lightweight AR eval + media (optional)
+        # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0):
-            val_rng = jax.random.PRNGKey(9999)
-            _, (val_frames, val_actions) = next_batch(val_rng)
-            dyn_vars_eval = with_params(dyn_vars, params)
-            ctx_length = min(32, cfg.T - 1)
-            regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
-
-            for tag, sconf in regimes:
-                sconf.mae_eval_key = mae_eval_key
-                sconf.rng_key = jax.random.PRNGKey(4242)
-                t0 = time.time()
-                pred_frames, floor_frames, gt_frames = sample_video(
-                    encoder=encoder, decoder=decoder, dynamics=dynamics,
-                    enc_vars=enc_vars, dec_vars=dec_vars, dyn_vars=dyn_vars_eval,
-                    frames=val_frames, actions=val_actions, config=sconf,
-                )
-                dt = time.time() - t0
-                HZ = sconf.horizon
-                mse = jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2)
-                psnr = 10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12))
-                print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={float(mse):.6g} | PSNR={float(psnr):.2f} dB | {dt:.2f}s")
-
-                # Build tiled video over batch
-                gt_np_all    = _to_uint8(gt_frames)
-                floor_np_all = _to_uint8(floor_frames)
-                pred_np_all  = _to_uint8(pred_frames)
-
-                T_total = gt_np_all.shape[1]
-                ncols = 1 if cfg.B <= 2 else min(2, cfg.B)
-                grid_frames = []
-                for t_idx in range(T_total):
-                    trip_list = [
-                        _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
-                        for b in range(cfg.B)
-                    ]
-                    grid_img = _tile_triptychs(trip_list, ncols=ncols, pad_color=0)
-                    grid_frames.append(grid_img)
-
-                tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-                mp4_path = tag_dir / f"{tag}_grid.mp4"
-                try:
-                    with imageio.get_writer(mp4_path, fps=25, codec="libx264", quality=8) as w:
-                        for fr in grid_frames:
-                            w.append_data(fr)
-                except Exception as e:
-                    print(f"[eval:{tag}] MP4 write skipped ({e})")
-
-                plan = _plan_from_sconf(sconf)
-                plan["step"] = int(step)
-                plan["mse"] = float(mse)
-                plan["psnr_db"] = float(psnr)
-                plan_path = tag_dir / f"{tag}_plan.json"
-                with open(plan_path, "w") as f:
-                    json.dump(plan, f, indent=2)
-                print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
+            run_evaluation(
+                cfg=cfg,
+                step=step,
+                train_state=train_state,
+                next_batch=next_batch,
+                vis_dir=vis_dir,
+            )
 
     # Ensure all writes finished
     mngr.wait_until_finished()
@@ -625,6 +797,6 @@ def run(cfg: RealismConfig):
 
 
 if __name__ == "__main__":
-    cfg = RealismConfig()
+    cfg = RealismConfig(run_name="realism_streaming_efficient", tokenizer_ckpt="/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints")
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
