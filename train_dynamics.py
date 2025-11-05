@@ -56,7 +56,7 @@ class RealismConfig:
     wandb_project: str | None = None  # if None, uses run_name as project
 
     # data
-    B: int = 8
+    B: int = 64
     T: int = 64
     H: int = 32
     W: int = 32
@@ -87,8 +87,8 @@ class RealismConfig:
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
     # train
-    max_steps: int = 50_000
-    log_every: int = 1_000
+    max_steps: int = 1_000_000_000
+    log_every: int = 5_000
     lr: float = 3e-4
 
     # eval media toggle
@@ -865,7 +865,12 @@ if __name__ == "__main__":
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-
+        max_steps=1_000_000_000,
+        log_every=5_000,
+        lr=1e-4,
+        write_video_every=100_000,
+        ckpt_save_every=100_000,
+        ckpt_max_to_keep=2,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)

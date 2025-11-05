@@ -35,9 +35,10 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
         - [x] shortcut loss function 
         - [x] visualization of predictions
         - [x] optimized loss function 
-        - [ ] proper checkpointing and loading encoder weights
+        - [x] proper checkpointing and loading encoder weights
 - [ ] Imagination training 
     - [ ] Behavior cloning and reward model
+        - [ ] Update dynamics model architecture to take in agent tokens.
     - [ ] RL Training
 - [ ] Small offline RL dataset generation (Atari-5 or Craftax)
 - [ ] Interactive decision making
