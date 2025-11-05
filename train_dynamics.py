@@ -49,7 +49,7 @@ class RealismConfig:
     log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
     ckpt_save_every: int = 10_000
-    
+
     # wandb config
     use_wandb: bool = False
     wandb_entity: str | None = None  # if None, uses default entity
@@ -76,7 +76,7 @@ class RealismConfig:
     d_model_dyn: int = 128
     enc_depth: int = 8
     dec_depth: int = 8
-    dyn_depth: int = 6
+    dyn_depth: int = 8
     n_heads: int = 4
     packing_factor: int = 2
     n_r: int = 4 # number of register tokens for dynamics
@@ -390,27 +390,27 @@ def build_tiled_video_frames(
 ) -> list[np.ndarray]:
     """
     Build tiled video frames from ground truth, floor, and prediction frames.
-    
+
     Each frame in the output contains a grid of triplets (GT | Floor | Pred) stacked horizontally,
     with multiple batch items tiled vertically/horizontally.
-    
+
     Args:
         gt_frames: Ground truth frames (B, T, H, W, C)
         floor_frames: Floor/reference frames (B, T, H, W, C)
         pred_frames: Predicted frames (B, T, H, W, C)
         batch_size: Batch size B
-        
+
     Returns:
         List of grid frames, one per time step
     """
     gt_np_all = _to_uint8(gt_frames)
     floor_np_all = _to_uint8(floor_frames)
     pred_np_all = _to_uint8(pred_frames)
-    
+
     T_total = gt_np_all.shape[1]
     ncols = 1 if batch_size <= 2 else min(2, batch_size)
     grid_frames = []
-    
+
     for t_idx in range(T_total):
         trip_list = [
             _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
@@ -418,7 +418,7 @@ def build_tiled_video_frames(
         ]
         grid_img = _tile_videos(trip_list, ncols=ncols, pad_color=0)
         grid_frames.append(grid_img)
-    
+
     return grid_frames
 
 def save_evaluation_video(
@@ -428,12 +428,12 @@ def save_evaluation_video(
 ) -> bool:
     """
     Save grid frames as an MP4 video file.
-    
+
     Args:
         grid_frames: List of grid frames to write
         output_path: Path where MP4 should be saved
         tag: Tag for error messages
-        
+
     Returns:
         True if successful, False otherwise
     """
@@ -455,7 +455,7 @@ def save_evaluation_plan(
 ):
     """
     Save evaluation plan/metadata as JSON.
-    
+
     Args:
         sampler_conf: Sampler configuration
         step: Training step number
@@ -467,7 +467,7 @@ def save_evaluation_plan(
     plan["step"] = int(step)
     plan["mse"] = float(mse)
     plan["psnr_db"] = float(psnr)
-    
+
     with open(output_path, "w") as f:
         json.dump(plan, f, indent=2)
 
@@ -532,7 +532,7 @@ def initialize_models_and_tokenizer(
 ) -> TrainState:
     """
     Initialize encoder, decoder, dynamics models and restore tokenizer.
-    
+
     Returns:
         TrainState containing all initialized models, variables, and optimizer state.
     """
@@ -603,7 +603,7 @@ def initialize_models_and_tokenizer(
 
     tx = optax.adam(cfg.lr)
     opt_state = tx.init(params)
-    
+
     return TrainState(
         encoder=encoder,
         decoder=decoder,
@@ -633,7 +633,7 @@ def run_evaluation(
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
-    
+
     Args:
         cfg: Configuration object
         step: Current training step
@@ -651,7 +651,7 @@ def run_evaluation(
         sampler_conf.mae_eval_key = train_state.mae_eval_key
         sampler_conf.rng_key = jax.random.PRNGKey(4242)
         t0 = time.time()
-        
+
         pred_frames, floor_frames, gt_frames = sample_video(
             encoder=train_state.encoder,
             decoder=train_state.decoder,
@@ -661,7 +661,7 @@ def run_evaluation(
             dyn_vars=dyn_vars_eval,
             frames=val_frames, actions=val_actions, config=sampler_conf,
         )
-        
+
         dt = time.time() - t0
         HZ = sampler_conf.horizon
         mse = float(jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2))
@@ -680,12 +680,12 @@ def run_evaluation(
         tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
         mp4_path = tag_dir / f"{tag}_grid.mp4"
         plan_path = tag_dir / f"{tag}_plan.json"
-        
+
         save_evaluation_video(grid_frames, mp4_path, tag)
         save_evaluation_plan(sampler_conf, step, mse, psnr, plan_path)
-        
+
         print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
-        
+
         # Log to wandb
         if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
             # Log metrics
@@ -720,7 +720,7 @@ def run(cfg: RealismConfig):
                 dir=str(Path(cfg.log_dir).resolve()),
             )
             print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
-    
+
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
     run_dir = _ensure_dir(root / cfg.run_name)
@@ -743,9 +743,9 @@ def run(cfg: RealismConfig):
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
     _, (frames_init, actions_init) = next_batch(init_rng)
-    
+
     train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
-    
+
     # Extract some values for checkpointing
     patch = cfg.patch
     k_max = cfg.k_max
@@ -811,7 +811,7 @@ def run(cfg: RealismConfig):
             boot_mse = float(aux['bootstrap_mse'])
             step_time = time.time() - train_step_start_time
             total_time = time.time() - start_wall
-            
+
             pieces = [
                 f"[train] step={step:06d}",
                 f"flow_mse={flow_mse:.6g}",
@@ -820,7 +820,7 @@ def run(cfg: RealismConfig):
                 f"total_t={total_time:.1f}s",
             ]
             print(" | ".join(pieces))
-            
+
             # Log to wandb
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
@@ -850,7 +850,7 @@ def run(cfg: RealismConfig):
 
     # Save final config
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
-    
+
     # Finish wandb run
     if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()
@@ -859,11 +859,13 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="test_wandb_run_fixvideo", 
-        tokenizer_ckpt="/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints",
+        run_name="test_b200",
+        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         use_wandb=True,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
+        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
