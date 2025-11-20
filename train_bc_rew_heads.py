@@ -9,6 +9,7 @@ from functools import partial
 import json
 import time
 import math
+from einops import reduce
 
 import jax
 import jax.numpy as jnp
@@ -68,7 +69,7 @@ class RealismConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
-    action_dim: int = 5 # number of categorical actions
+    action_dim: int = 4 # number of categorical actions
 
     # tokenizer / dynamics config
     patch: int = 4
@@ -103,6 +104,8 @@ class RealismConfig:
     # NEW: multi-token prediction (MTP) settings
     L: int = 2                      # predict next L actions/rewards
     num_reward_bins: int = 101      # twohot bins for symexp rewards
+    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
+    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
     n_tasks: int = 128              # task-ID space for TaskEmbedder
     use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
     
@@ -250,20 +253,24 @@ def _gather_future_rewards(values_bt, L):
     values_bt: (B, T) float values (e.g., rewards)
     returns: values_btL (B, T, L) and mask_btL (B, T, L) where mask=0 for invalid
     
-    At timestep t, predicts values[t+1], values[t+2], ..., values[t+L]
-    Following Dreamer convention: r0 is dummy (invalid), predict r1, r2, ... from state s0
+    At timestep t, predicts values[t], values[t+1], ..., values[t+L-1]
+    Following Dreamer convention: r0 is dummy (invalid), so we predict r_t from h_t for t >= 1.
+    The first offset (n=0) predicts r_t, which depends on a_t that h_t can see.
     """
     B, T = values_bt.shape
-    values_pad = jnp.pad(values_bt, ((0,0),(0,L)), constant_values=0.0)
+    values_pad = jnp.pad(values_bt, ((0,0),(0,L-1)), constant_values=0.0)
     
-    # Vectorized version: offsets start at 1 to predict NEXT L values
-    offsets = jnp.arange(1, L+1)  # (L,) = [1, 2, ..., L]
+    # Vectorized version: offsets start at 0 to predict CURRENT and next L-1 values
+    offsets = jnp.arange(0, L)  # (L,) = [0, 1, ..., L-1]
     indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
     values_btL = values_pad[:, indices]  # (B, T, L)
     
-    # Validity: index must be < T (in bounds) AND >= 1 (skip r0 which is dummy)
-    # For timestep t, we access index t+offset, so valid when: 1 <= t+offset < T
-    valid_btL = (indices >= 1) & (indices < T)  # (T, L)
+    # Validity: 
+    #   - index must be >= 1 (skip r0 which is dummy)
+    #   - index must be < T (stay in bounds)
+    #   - timestep t must be >= 1 (don't predict from h_0, which has invalid reward)
+    # For timestep t, we access index t+offset, so valid when: t >= 1 AND 1 <= t+offset < T
+    valid_btL = (indices >= 1) & (indices < T) & (jnp.arange(T)[:, None] >= 1)  # (T, L)
     valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))  # (B, T, L)
     
     return values_btL, valid_btL
@@ -373,19 +380,13 @@ def train_step_efficient(
         agent_tokens = task_embedder.apply(local_task, dummy_task_ids, B, T)
 
         # Main forward (emp + self) → z1_hat and agent readouts h
-        z1_hat_full, h = dynamics.apply(
+        z1_hat_full, h_btnd = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
             agent_tokens=agent_tokens, rngs={"dropout": drop_key}, deterministic=False,
         )  # z1_hat_full: (B,T,Sz,Dz), h: (B,T,n_agent,D)
 
         # Pool agents (mean) → (B,T,D)
-        if h is None:
-            # fallback shouldn't trigger since n_agent>0; use dyn d_model if needed
-            d_model = p["dyn"]["proj_spatial"]["kernel"].shape[1]
-            h_pooled = jnp.zeros((B, T, d_model), dtype=z1.dtype)
-        else:
-            h_pooled = jnp.mean(h, axis=2)
-
+        h_pooled_btd = reduce(h_btnd, "b t n_agent d -> b t d", "mean")
         # ---------- Flow loss on empirical rows (to z1) ----------
         z1_hat_emp  = z1_hat_full[:B_emp]
         z1_hat_self = z1_hat_full[B_emp:]
@@ -422,7 +423,7 @@ def train_step_efficient(
 
         # ---------- MTP: Policy (categorical CE over next L actions) ----------
         # logits: (B,T,L,A)
-        pi_logits = policy_head.apply(local_pi, h_pooled, rngs={"dropout": drop_pi}, deterministic=False)
+        pi_logits = policy_head.apply(local_pi, h_pooled_btd, rngs={"dropout": drop_pi}, deterministic=False)
 
         labels_btL, valid_btL = _gather_future_actions(actions_full, L)  # (B,T,L), (B,T,L)
         logp = jax.nn.log_softmax(pi_logits, axis=-1)                # (B,T,L,A)
@@ -433,15 +434,16 @@ def train_step_efficient(
         denom = jnp.maximum(valid_btL.sum(), 1)
         pi_ce = jnp.sum(nll) / denom
 
-        # ---------- MTP: Reward (symexp twohot CE over next L rewards) ----------
+        # ---------- MTP: Reward (symexp twohot CE over current and future L rewards) ----------
         # rewards: (B, T) where rewards[:, 0] = r0 (dummy, invalid)
         #          and rewards[:, 1] = r1, rewards[:, 2] = r2, ... are valid
-        # At timestep t, we predict rewards[t+1], rewards[t+2], ..., rewards[t+L]
-        # Gather future rewards with correct offsets
+        # At timestep t >= 1, we predict rewards[t], rewards[t+1], ..., rewards[t+L-1]
+        # The first offset (n=0) predicts r_t from h_t, which contains a_t
+        # We skip t=0 entirely since h_0 has no valid reward to predict
         rew_btL, valid_rew_btL = _gather_future_rewards(rewards, L)  # (B,T,L), (B,T,L)
 
         # Get bin centers (constants collection) and logits in one forward pass
-        rew_logits, centers_log = reward_head.apply(local_rw, h_pooled, rngs={"dropout": drop_rw}, deterministic=False)
+        rew_logits, centers_log = reward_head.apply(local_rw, h_pooled_btd, rngs={"dropout": drop_rw}, deterministic=False)
         twohot = _twohot_symlog_targets(rew_btL, centers_log)               # (B,T,L,K)
         logq = jax.nn.log_softmax(rew_logits, axis=-1)                      # (B,T,L,K)
         ce_rew = -jnp.sum(twohot * logq, axis=-1)                           # (B,T,L)
@@ -775,7 +777,8 @@ def initialize_models_and_tokenizer(
     task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
                                  use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
     policy_head  = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins)
+    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins,
+                                 log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
 
     rng_task, rng_pi, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
     dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
@@ -1064,7 +1067,7 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_bc_rew_4actions",
+        run_name="train_bc_rew_fixrewpredbug",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
         use_wandb=True,

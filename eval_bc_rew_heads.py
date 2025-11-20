@@ -49,7 +49,7 @@ class EvalConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
-    action_dim: int = 5
+    action_dim: int = 4
 
     # Tokenizer / dynamics
     patch: int = 4
@@ -70,6 +70,8 @@ class EvalConfig:
     # Heads
     L: int = 2
     num_reward_bins: int = 101
+    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
+    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
     n_tasks: int = 128
     use_task_ids: bool = True
 
@@ -150,13 +152,30 @@ def _gather_future_actions(labels_bt, L):
     return labels_btL, valid_btL
 
 def _gather_future_rewards(values_bt, L):
+    """
+    values_bt: (B, T) float values (e.g., rewards)
+    returns: values_btL (B, T, L) and mask_btL (B, T, L) where mask=0 for invalid
+    
+    At timestep t, predicts values[t], values[t+1], ..., values[t+L-1]
+    Following Dreamer convention: r0 is dummy (invalid), so we predict r_t from h_t for t >= 1.
+    The first offset (n=0) predicts r_t, which depends on a_t that h_t can see.
+    """
     B, T = values_bt.shape
-    values_pad = jnp.pad(values_bt, ((0,0),(0,L)), constant_values=0.0)
-    offsets = jnp.arange(1, L+1)
-    idx = jnp.arange(T)[:, None] + offsets[None, :]
-    values_btL = values_pad[:, idx]
-    valid_btL = (idx >= 1) & (idx < T)
-    valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))
+    values_pad = jnp.pad(values_bt, ((0,0),(0,L-1)), constant_values=0.0)
+    
+    # Vectorized version: offsets start at 0 to predict CURRENT and next L-1 values
+    offsets = jnp.arange(0, L)  # (L,) = [0, 1, ..., L-1]
+    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
+    values_btL = values_pad[:, indices]  # (B, T, L)
+    
+    # Validity: 
+    #   - index must be >= 1 (skip r0 which is dummy)
+    #   - index must be < T (stay in bounds)
+    #   - timestep t must be >= 1 (don't predict from h_0, which has invalid reward)
+    # For timestep t, we access index t+offset, so valid when: t >= 1 AND 1 <= t+offset < T
+    valid_btL = (indices >= 1) & (indices < T) & (jnp.arange(T)[:, None] >= 1)  # (T, L)
+    valid_btL = jnp.broadcast_to(valid_btL[None, :, :], (B, T, L))  # (B, T, L)
+    
     return values_btL, valid_btL
 
 def _save_reward_lineplot(fig_path: Path,
@@ -363,7 +382,8 @@ def init_models_and_restore(cfg: EvalConfig):
     task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
                                  use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
     policy_head  = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins)
+    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins,
+                                 log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
 
     # shape init
     rng = jax.random.PRNGKey(0)
@@ -585,8 +605,8 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     print(f"[eval:TF] wrote {out_mp4}")
 
     # Save a few example strips
-    # For strip plots, project L-step predictions to per-frame at offsets=1
-    o1 = 0  # use the +1 offset (index 0)
+    # For strip plots, project L-step predictions to per-frame at offset=0 (current timestep)
+    o1 = 0  # use offset 0 to predict current reward r[t]
     o1 = min(o1, cfg.L - 1)
 
     # Full-length (B, T)
@@ -597,28 +617,28 @@ def eval_teacher_forced(cfg: EvalConfig, env, out_dir: Path):
     pred_rewards_h = pred_rewards_t[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, h)
 
 
-    # --- Align GT to NEXT (+1) for fair comparison/visuals ---
-    # predictions at each column i correspond to a_{ctx+i+1}, r_{ctx+i+1}
-    gt_actions_next_h = actions[:, cfg.ctx_length+1 : cfg.ctx_length + cfg.horizon + 1]  # (B, horizon)
-    gt_rewards_next_h = rewards[:, cfg.ctx_length+1 : cfg.ctx_length + cfg.horizon + 1]  # (B, horizon)
+    # --- Align GT to CURRENT timestep for fair comparison/visuals ---
+    # predictions at each column i correspond to a_{ctx+i}, r_{ctx+i} (current timestep)
+    gt_actions_h = actions[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, horizon)
+    gt_rewards_h = rewards[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon]  # (B, horizon)
 
-    # Strips: use horizon-length, +1-shifted GT so columns match predicted next
+    # Strips: use horizon-length GT aligned to current timestep
     for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
         fig_path = out_dir / f"tf_strip_b{ei}.png"
         _save_strip(
             fig_path, np.asarray(gt_frames), cfg.ctx_length, cfg.horizon,
-            gt_actions_bt=np.asarray(gt_actions_next_h),   # (B, horizon) ← shifted
+            gt_actions_bt=np.asarray(gt_actions_h),   # (B, horizon)
             pred_actions_bt=np.asarray(pred_actions_h),    # (B, horizon)
-            gt_rewards_bt=np.asarray(gt_rewards_next_h),   # (B, horizon) ← shifted
+            gt_rewards_bt=np.asarray(gt_rewards_h),   # (B, horizon)
             pred_rewards_bt=np.asarray(pred_rewards_h),    # (B, horizon)
             title=f"Teacher-Forced: example {ei}",
             b_index=ei,
         )
         print(f"[eval:TF] wrote {fig_path}")
 
-    # Reward line plots (GT vs Pred) over the horizon, using +1-shifted GT
+    # Reward line plots (GT vs Pred) over the horizon, aligned to current timestep
     for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
-        gt_line = np.asarray(gt_rewards_next_h[ei])
+        gt_line = np.asarray(gt_rewards_h[ei])
         pred_line = np.asarray(pred_rewards_h[ei])
         plot_path = out_dir / f"tf_reward_line_b{ei}.png"
         _save_reward_lineplot(plot_path, gt_line, pred_line, title=f"TF reward curve (b={ei})")
@@ -774,7 +794,8 @@ def eval_autoregressive(cfg: EvalConfig, env, out_dir: Path):
         print(f"[eval:AR] wrote {fig_path}")
 
     # Reward line plots (we DO have GT; show it for clarity)
-    gt_line_all = np.asarray(rewards[:, cfg.ctx_length+1 : cfg.ctx_length + cfg.horizon + 1])
+    # pred_rew_real[t] predicts r[ctx_length + t] (current reward at timestep ctx_length + t)
+    gt_line_all = np.asarray(rewards[:, cfg.ctx_length : cfg.ctx_length + cfg.horizon])
     for ei in range(min(cfg.max_examples_to_plot, cfg.B)):
         gt_line = gt_line_all[ei]
         pred_line = np.asarray(pred_rew_real[ei])
@@ -824,11 +845,11 @@ def main(cfg: EvalConfig):
 if __name__ == "__main__":
     # EXAMPLE PATHS — adjust to your environment
     cfg = EvalConfig(
-        run_ckpt_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew/checkpoints",
+        run_ckpt_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_fixrewpredbug/checkpoints",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        out_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/eval_bc_rew_heads_shortcut",
+        out_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/eval_bc_rew_heads_shortcut_fixrew",
         B=8, T=64, H=32, W=32, C=3,
-        action_dim=5,
+        action_dim=4,
         ctx_length=32, horizon=16,
         schedule="shortcut", d=1/4,           # or schedule="shortcut", d=0.25
         ctx_signal_tau=1.0, match_ctx_tau=False,
