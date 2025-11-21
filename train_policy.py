@@ -1170,28 +1170,7 @@ def run(cfg: RLConfig):
                     "n_negative": int(aux["n_negative"]),
                 }, step=step)
       
-        # TODO: figure out visualization logic. Periodically rollout the policy. 
-        # Visualize imagined rollouts (decode latents to frames and display scores)
-        # if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-        #     visualize_imagined_rollouts(
-        #         imagined_latents=imagined_latents,
-        #         imagined_actions=imagined_actions,
-        #         rewards=rewards,
-        #         values=values,
-        #         td_lambda_returns=td_lambda_returns,
-        #         decoder=train_state.decoder,
-        #         dec_vars=train_state.dec_vars,
-        #         n_spatial=n_spatial,
-        #         packing_factor=cfg.packing_factor,
-        #         H=cfg.H,
-        #         W=cfg.W,
-        #         C=cfg.C,
-        #         patch=patch,
-        #         horizon=cfg.horizon,
-        #         vis_dir=vis_dir,
-        #         step=step,
-        #         max_examples=4,
-        #     )      
+        # TODO: add in logic to evaluate the
         # Save checkpoint
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
         maybe_save(mngr, step, state, meta)
@@ -1210,8 +1189,8 @@ def run(cfg: RLConfig):
 
 if __name__ == "__main__":
     cfg = RLConfig(
-        run_name="train_policy",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_4actions/checkpoints",
+        run_name="train_policy_test",
+        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_fixrewpredbug/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",

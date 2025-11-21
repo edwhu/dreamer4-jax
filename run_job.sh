@@ -11,7 +11,7 @@
 cd ~/projects/tiny_dreamer_4
 source .venv/bin/activate
 
-EXPERIMENT="train_bc_rew_heads"
+EXPERIMENT="train_bc_rew_heads_flippedrew"
 #export WANDB_API_KEY="24e6ba2cb3e7bced52962413c58277801d14bba0"
 #export WANDB_RUN_GROUP=$EXPERIMENT;
 SEED=$SLURM_ARRAY_TASK_ID

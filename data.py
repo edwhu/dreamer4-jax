@@ -9,10 +9,78 @@ from einops import rearrange
 # ============================================================
 
 # Action space (categorical):
-#   0: up, 1: down, 2: left, 3: right, 4: initial
+#   0: up, 1: down, 2: left, 3: right, 4: initial (null)
 # Directions are in (dy, dx) order for image coordinates.
 ACTION_DELTAS_YX = jnp.array(
     [[-1, 0], [1, 0], [0, -1], [0, 1]], dtype=jnp.int32
+)
+NULL_ACTION = jnp.int32(4)
+
+
+# ============================================================
+# Shared painting helpers
+# ============================================================
+
+
+def _paint_squares_batch(
+    init_background_color: jnp.ndarray,  # (B, C) uint8
+    init_foreground_color: jnp.ndarray,  # (B, C) uint8
+    positions: jnp.ndarray,  # (B, T, 2) int32 (y, x)
+    square_sizes: jnp.ndarray,  # (B,) int32
+    height: jnp.ndarray | int,  # scalar int32 or Python int
+    width: jnp.ndarray | int,   # scalar int32 or Python int
+    channels: jnp.ndarray | int,  # scalar int32 or Python int
+) -> jnp.ndarray:
+    """
+    Paint axis-aligned squares onto a batch of frames.
+
+    Args:
+        init_background_color: (B, C) uint8 background colors.
+        positions: (B, T, 2) int32 top-left (y, x) per frame.
+        square_sizes: (B,) int32 side length per sample.
+        height, width, channels: spatial dimensions (can be Python int or JAX scalar).
+
+    Returns:
+        video: (B, T, H, W, C) uint8
+    """
+    B = positions.shape[0]
+    T = positions.shape[1]
+    # Convert to JAX scalars if needed (works for both Python int and JAX array)
+    H = height
+    W = width
+    C = channels
+
+    ys = jnp.arange(H)
+    xs = jnp.arange(W)
+
+    # initialize backgrounds
+    video = (
+        jnp.ones((B, T, H, W, C), dtype=jnp.uint8)
+        * init_background_color[:, None, None, None, :]
+    )
+
+    def paint_one(frame, y, x, color, k):
+        """Paint one square of size (k,k) at (y,x) on a single frame."""
+        ymask = (ys >= y) & (ys < y + k)
+        xmask = (xs >= x) & (xs < x + k)
+        mask = (ymask[:, None] & xmask[None, :])[..., None]
+        return jnp.where(mask, color[None, None, :], frame)
+
+    # Vectorize over time and batch
+    paint_over_time = jax.vmap(paint_one, in_axes=(0, 0, 0, None, None))
+    paint_over_batch = jax.vmap(paint_over_time, in_axes=(0, 0, 0, 0, 0))
+
+    y_idx = positions[..., 0]
+    x_idx = positions[..., 1]
+    # Paint squares using the foreground color on top of the background.
+    video = paint_over_batch(video, y_idx, x_idx, init_foreground_color, square_sizes)
+    return video
+
+
+# JIT-compiled version with static height, width, channels
+_paint_squares_batch_jit = jax.jit(
+    _paint_squares_batch,
+    static_argnames=("height", "width", "channels"),
 )
 
 
@@ -118,7 +186,9 @@ def generate_batch(
     # Compute pixel distance: sqrt((y_center - H/2)^2 + (x_center - W/2)^2)
     # Only compute rewards for timesteps [1, T] (skip initial state at t=0)
     distances = square_centers[:, 1:, :] - image_center  # (B, T-1, 2)
-    rewards_t1 = jnp.linalg.norm(distances, axis=-1)  # (B, T-1)
+    # Use negative distance as reward so that higher return corresponds to
+    # staying closer to the image center (hovering near center).
+    rewards_t1 = -jnp.linalg.norm(distances, axis=-1)  # (B, T-1)
     
     # Prepend dummy reward at t=0 (use NaN so any accidental use will be obvious)
     dummy_reward = jnp.full((batch_size, 1), jnp.nan, dtype=jnp.float32)
@@ -307,6 +377,265 @@ def make_iterator(
 
     return next
 
+
+# ============================================================
+# Simple batched environment API (reset / step)
+# ============================================================
+
+
+def env_reset(
+    key: jax.Array,
+    *,
+    batch_size: int,
+    height: int,
+    width: int,
+    channels: int,
+    pixels_per_step: int = 1,
+    size_min: int = 5,
+    size_max: int = 12,
+    fg_min_color: int = 0,
+    fg_max_color: int = 255,
+    bg_min_color: int = 0,
+    bg_max_color: int = 255,
+):
+    """
+    Batched environment reset for the bouncing-square world.
+
+    Returns:
+        env_state: dict PyTree containing static env parameters and per-env state.
+        obs0:      (B, H, W, C) float32 in [0,1]
+        a0:        (B,) int32 null actions (value = 4)
+        r0:        (B,) float32 dummy rewards (NaN)
+    """
+    B = batch_size
+    H, W, C = height, width, channels
+
+    k_pos, k_bg, k_fg, k_size = jax.random.split(key, 4)
+
+    # sample initial states
+    init_pos = jax.random.randint(
+        k_pos,
+        (B, 2),
+        minval=jnp.array([0, 0]),
+        maxval=jnp.array([H, W]),
+        dtype=jnp.int32,
+    )
+    init_bg = jax.random.randint(
+        k_bg,
+        (B, C),
+        bg_min_color,
+        bg_max_color + 1,
+        dtype=jnp.uint8,
+    )
+    init_fg = jax.random.randint(
+        k_fg,
+        (B, C),
+        fg_min_color,
+        fg_max_color + 1,
+        dtype=jnp.uint8,
+    )
+    sizes = jax.random.randint(
+        k_size,
+        (B,),
+        size_min,
+        size_max + 1,
+        dtype=jnp.int32,
+    )
+    # ensure squares fit
+    k_b = jnp.clip(sizes, 1, jnp.minimum(H, W))
+
+    # positions for the initial frame only, shape (B, 1, 2)
+    positions0 = init_pos[:, None, :]
+    # Use JIT-compiled version with static args (H, W, C are Python ints)
+    video0_uint8 = _paint_squares_batch_jit(
+        init_background_color=init_bg,
+        init_foreground_color=init_fg,
+        positions=positions0,
+        square_sizes=k_b,
+        height=H,
+        width=W,
+        channels=C,
+    )
+    obs0 = video0_uint8[:, 0].astype(jnp.float32) / 255.0  # (B, H, W, C)
+
+    a0 = jnp.full((B,), NULL_ACTION, dtype=jnp.int32)
+    r0 = jnp.full((B,), jnp.nan, dtype=jnp.float32)
+
+    env_state = {
+        "pos": init_pos,
+        "square_size": k_b,
+        "bg_color": init_bg,
+        "fg_color": init_fg,
+        "height": H,  # Store as Python int (static)
+        "width": W,   # Store as Python int (static)
+        "channels": C,  # Store as Python int (static)
+        "pixels_per_step": pixels_per_step,  # Store as Python int (static)
+    }
+
+    return env_state, obs0, a0, r0
+
+
+def env_step(env_state: dict, actions: jnp.ndarray, *, height: int, width: int, channels: int):
+    """
+    Batched environment step.
+
+    Args:
+        env_state: dict from `env_reset`.
+        actions:   (B,) int32 in {0,1,2,3}
+        height, width, channels: static spatial dimensions (must match env_state values)
+
+    Returns:
+        env_state_next: updated state dict
+        obs_next:       (B, H, W, C) float32 in [0,1]
+        rewards_next:   (B,) float32 reward from taking `actions`
+        dones_next:     (B,) bool (currently always False)
+    """
+    pos = env_state["pos"]  # (B, 2)
+    k_b = env_state["square_size"]  # (B,)
+    H = height  # Use static arg
+    W = width   # Use static arg
+    C = channels  # Use static arg
+    pixels_per_step = env_state["pixels_per_step"]
+
+    B = pos.shape[0]
+
+    # Motion deltas per action
+    deltas = ACTION_DELTAS_YX * pixels_per_step  # (4, 2)
+    dy_dx = deltas[actions]  # (B, 2)
+    dy = dy_dx[:, 0]
+    dx = dy_dx[:, 1]
+
+    y = pos[:, 0]
+    x = pos[:, 1]
+
+    # Update positions with reflection at boundaries
+    max_y = H - k_b
+    max_x = W - k_b
+
+    y_next = y + dy
+    x_next = x + dx
+
+    y_next = jnp.where(y_next < 0, -y_next, y_next)
+    y_next = jnp.where(y_next > max_y, 2 * max_y - y_next, y_next)
+
+    x_next = jnp.where(x_next < 0, -x_next, x_next)
+    x_next = jnp.where(x_next > max_x, 2 * max_x - x_next, x_next)
+
+    pos_next = jnp.stack([y_next, x_next], axis=-1)  # (B, 2)
+
+    # Reward: distance from square center to image center.
+    H_f = jnp.asarray(H, dtype=jnp.float32)
+    W_f = jnp.asarray(W, dtype=jnp.float32)
+    image_center = jnp.array([H_f / 2.0, W_f / 2.0], dtype=jnp.float32)
+
+    square_centers = pos_next.astype(jnp.float32) + k_b[:, None] / 2.0  # (B, 2)
+    distances = square_centers - image_center  # (B, 2)
+    rewards_next = jnp.linalg.norm(distances, axis=-1)  # (B,)
+
+    # Render next observation
+    positions1 = pos_next[:, None, :]  # (B, 1, 2)
+    # Use JIT-compiled version with static args (H, W, C are Python ints from env_state)
+    video1_uint8 = _paint_squares_batch_jit(
+        init_background_color=env_state["bg_color"],
+        init_foreground_color=env_state["fg_color"],
+        positions=positions1,
+        square_sizes=k_b,
+        height=H,
+        width=W,
+        channels=C,
+    )
+    obs_next = video1_uint8[:, 0].astype(jnp.float32) / 255.0  # (B, H, W, C)
+
+    dones_next = jnp.zeros((B,), dtype=bool)
+
+    env_state_next = dict(env_state)
+    env_state_next["pos"] = pos_next
+
+    return env_state_next, obs_next, rewards_next, dones_next
+
+
+def make_env_reset_fn(
+    *,
+    batch_size: int,
+    height: int,
+    width: int,
+    channels: int,
+    pixels_per_step: int = 1,
+    size_min: int = 5,
+    size_max: int = 12,
+    fg_min_color: int = 0,
+    fg_max_color: int = 255,
+    bg_min_color: int = 0,
+    bg_max_color: int = 255,
+):
+    """
+    Convenience wrapper that returns a JITted `reset(key)` function
+    with static geometry and sampling hyperparameters bound.
+    """
+
+    @partial(
+        jax.jit,
+        static_argnames=(
+            "batch_size",
+            "height",
+            "width",
+            "channels",
+            "pixels_per_step",
+            "size_min",
+            "size_max",
+            "fg_min_color",
+            "fg_max_color",
+            "bg_min_color",
+            "bg_max_color",
+        ),
+    )
+    def _reset(
+        key,
+        batch_size=batch_size,
+        height=height,
+        width=width,
+        channels=channels,
+        pixels_per_step=pixels_per_step,
+        size_min=size_min,
+        size_max=size_max,
+        fg_min_color=fg_min_color,
+        fg_max_color=fg_max_color,
+        bg_min_color=bg_min_color,
+        bg_max_color=bg_max_color,
+    ):
+        return env_reset(
+            key,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            channels=channels,
+            pixels_per_step=pixels_per_step,
+            size_min=size_min,
+            size_max=size_max,
+            fg_min_color=fg_min_color,
+            fg_max_color=fg_max_color,
+            bg_min_color=bg_min_color,
+            bg_max_color=bg_max_color,
+        )
+
+    return _reset
+
+
+def make_env_step_fn(*, height: int, width: int, channels: int):
+    """
+    Convenience wrapper that returns a JITted `step(env_state, actions)` function
+    with static geometry dimensions bound.
+    """
+
+    @partial(
+        jax.jit,
+        static_argnames=("height", "width", "channels"),
+    )
+    def _step(env_state, actions, height=height, width=width, channels=channels):
+        return env_step(env_state, actions, height=height, width=width, channels=channels)
+
+    return _step
+
 def patchify(x: jnp.ndarray, patch: int) -> jnp.ndarray:
     """
     x: (B, H, W, C)  ->  patches: (B, N, D)
@@ -374,5 +703,213 @@ def test_iterator():
     print("Saved stochastic_policy_iter.gif")
 
 
+def test_env_reset_draws_foreground_square():
+    """
+    Simple sanity check: env_reset should render at least one foreground pixel
+    that differs from the background color for each sample.
+    """
+    key = jax.random.PRNGKey(0)
+    B, H, W, C = 2, 32, 32, 3
+
+    env_state, obs0, a0, r0 = env_reset(
+        key,
+        batch_size=B,
+        height=H,
+        width=W,
+        channels=C,
+        pixels_per_step=1,
+        size_min=8,
+        size_max=8,
+        fg_min_color=255,
+        fg_max_color=255,
+        bg_min_color=0,
+        bg_max_color=255,
+    )
+
+    assert obs0.shape == (B, H, W, C)
+    assert a0.shape == (B,)
+    assert r0.shape == (B,)
+
+    # Convert observations back to uint8 for comparison.
+    obs0_u8 = jnp.asarray(jnp.round(obs0 * 255.0), dtype=jnp.uint8)
+    bg_colors = env_state["bg_color"]  # (B, C) uint8
+
+    # For each sample, ensure at least one pixel differs from the background color.
+    same_as_bg = obs0_u8 == bg_colors[:, None, None, :]
+    all_bg_per_sample = jnp.all(same_as_bg, axis=(1, 2, 3))
+    # We expect there to be at least one foreground pixel for every sample.
+    assert bool(jnp.all(~all_bg_per_sample))
+    print("test_env_reset_draws_foreground_square passed.")
+
+
+def test_env_step_updates_position_and_image():
+    """
+    Simple sanity check: env_step should change positions, change images, and
+    produce non-negative rewards with correct shapes.
+    """
+    key = jax.random.PRNGKey(1)
+    B, H, W, C = 2, 32, 32, 3
+
+    env_state, obs0, _, _ = env_reset(
+        key,
+        batch_size=B,
+        height=H,
+        width=W,
+        channels=C,
+        pixels_per_step=1,
+        size_min=8,
+        size_max=8,
+        fg_min_color=255,
+        fg_max_color=255,
+        bg_min_color=0,
+        bg_max_color=255,
+    )
+
+    # Take a simple deterministic action (all "down" = 1).
+    actions = jnp.full((B,), 1, dtype=jnp.int32)
+    env_state_next, obs_next, rewards_next, dones_next = env_step(
+        env_state,
+        actions,
+        height=H,
+        width=W,
+        channels=C,
+    )
+
+    # Positions should change for at least one batch element.
+    pos_changed = jnp.any(env_state_next["pos"] != env_state["pos"])
+    assert bool(pos_changed)
+
+    # Observations should differ from the initial frame for at least one pixel.
+    frames_differ = jnp.any(obs_next != obs0)
+    assert bool(frames_differ)
+
+    # Rewards are non-negative and have the right shape.
+    assert rewards_next.shape == (B,)
+    assert bool(jnp.all(rewards_next >= 0.0))
+
+    # Dones are all False for now.
+    assert dones_next.shape == (B,)
+    assert bool(jnp.all(dones_next == False))
+    print("test_env_step_updates_position_and_image passed.")
+
+
+def test_make_env_reset_step_fn_jittable():
+    """
+    Sanity check that the convenience wrappers for JIT-compiled reset/step
+    functions run and return correctly-shaped outputs.
+    """
+    key = jax.random.PRNGKey(2)
+    B, H, W, C = 2, 16, 16, 3
+
+    env_reset_fn = make_env_reset_fn(
+        batch_size=B,
+        height=H,
+        width=W,
+        channels=C,
+        pixels_per_step=1,
+        size_min=4,
+        size_max=8,
+        fg_min_color=64,
+        fg_max_color=255,
+        bg_min_color=0,
+        bg_max_color=255,
+    )
+    env_step_fn = make_env_step_fn(
+        height=H,
+        width=W,
+        channels=C,
+    )
+
+    env_state, obs0, a0, r0 = env_reset_fn(key)
+    assert obs0.shape == (B, H, W, C)
+    assert a0.shape == (B,)
+    assert r0.shape == (B,)
+
+    # Run a few steps with random actions to ensure the compiled fn executes.
+    step_keys = jax.random.split(key, 3)
+    env_state_t = env_state
+    obs_t = obs0
+    for k in step_keys:
+        actions = jax.random.randint(k, (B,), 0, 4, dtype=jnp.int32)
+        env_state_t, obs_t, rew_t, done_t = env_step_fn(env_state_t, actions)
+        assert obs_t.shape == (B, H, W, C)
+        assert rew_t.shape == (B,)
+        assert done_t.shape == (B,)
+    print("test_make_env_reset_step_fn_jittable passed.")
+
+
+def demo_env_api_rollout():
+    """
+    Small manual demo for the reset/step env API.
+
+    Runs a short rollout with random actions and saves a GIF where each row
+    corresponds to one environment in the batch.
+    """
+    key = jax.random.PRNGKey(0)
+    B, T = 4, 32
+    H, W, C = 32, 32, 3
+
+    reset_fn = make_env_reset_fn(
+        batch_size=B,
+        height=H,
+        width=W,
+        channels=C,
+        pixels_per_step=2,
+        size_min=6,
+        size_max=10,
+        fg_min_color=128,
+        fg_max_color=255,
+        bg_min_color=0,
+        bg_max_color=255,
+    )
+    step_fn = make_env_step_fn(
+        height=H,
+        width=W,
+        channels=C,
+    )
+
+    key, sub = jax.random.split(key)
+    env_state, obs0, _, _ = reset_fn(sub)
+
+    def rollout_step(carry, t):
+        env_state_t = carry
+        k_t = jax.random.fold_in(key, t)
+        actions_t = jax.random.randint(k_t, (B,), 0, 4, dtype=jnp.int32)
+        env_state_next, obs_next, _, _ = step_fn(env_state_t, actions_t)
+        return env_state_next, obs_next
+
+    _, obs_seq = jax.lax.scan(
+        rollout_step,
+        env_state,
+        jnp.arange(T),
+    )  # (T, B, H, W, C)
+
+    obs_seq = jnp.concatenate([obs0[None, ...], obs_seq], axis=0)  # (T+1, B, H, W, C)
+
+    # Stack each batch horizontally per frame for visualization.
+    def render_frame(frame_bt_hwc):
+        return jnp.concatenate(frame_bt_hwc, axis=1)
+
+    frames = jax.vmap(render_frame)(obs_seq)  # (T+1, H, B*W, C)
+    frames_u8 = jnp.asarray(frames * 255.0, dtype=jnp.uint8)
+
+    imageio.mimsave(
+        "env_api_rollout.gif",
+        frames_u8,
+        fps=8,
+        loop=1000,
+    )
+    print("Saved env_api_rollout.gif")
+
+
 if __name__ == "__main__":
-    test_iterator()
+    # print("Running test_iterator() ...")
+    # test_iterator()
+    print("Running test_env_reset_draws_foreground_square() ...")
+    test_env_reset_draws_foreground_square()
+    print("Running test_env_step_updates_position_and_image() ...")
+    test_env_step_updates_position_and_image()
+    print("Running test_make_env_reset_step_fn_jittable() ...")
+    test_make_env_reset_step_fn_jittable()
+    print("Running demo_env_api_rollout() ...")
+    demo_env_api_rollout()
