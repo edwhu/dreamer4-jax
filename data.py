@@ -127,7 +127,8 @@ def generate_batch(
     Returns:
         video:   (B,T,H,W,C) float32 in [0,1]
         actions: (B,T-1) int32
-        rewards: (B,T) float32 - pixel distance from square center to image center.
+        rewards: (B,T) float32 - negative pixel distance from square center to
+            image center (higher reward = closer to center).
             r_0 is dummy (NaN), r_t (t>=1) is reward from action a_t taken from s_{t-1}
     """
     H, W = height, width
@@ -530,7 +531,7 @@ def env_step(env_state: dict, actions: jnp.ndarray, *, height: int, width: int, 
 
     square_centers = pos_next.astype(jnp.float32) + k_b[:, None] / 2.0  # (B, 2)
     distances = square_centers - image_center  # (B, 2)
-    rewards_next = jnp.linalg.norm(distances, axis=-1)  # (B,)
+    rewards_next = -jnp.linalg.norm(distances, axis=-1)  # (B,)
 
     # Render next observation
     positions1 = pos_next[:, None, :]  # (B, 1, 2)
@@ -745,7 +746,7 @@ def test_env_reset_draws_foreground_square():
 def test_env_step_updates_position_and_image():
     """
     Simple sanity check: env_step should change positions, change images, and
-    produce non-negative rewards with correct shapes.
+    produce non-positive rewards (negative distance) with correct shapes.
     """
     key = jax.random.PRNGKey(1)
     B, H, W, C = 2, 32, 32, 3
@@ -783,9 +784,9 @@ def test_env_step_updates_position_and_image():
     frames_differ = jnp.any(obs_next != obs0)
     assert bool(frames_differ)
 
-    # Rewards are non-negative and have the right shape.
+    # Rewards are non-positive (negative distance) and have the right shape.
     assert rewards_next.shape == (B,)
-    assert bool(jnp.all(rewards_next >= 0.0))
+    assert bool(jnp.all(rewards_next <= 0.0))
 
     # Dones are all False for now.
     assert dones_next.shape == (B,)

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 JIT-friendly policy/value training using imagination rollouts.
 
@@ -19,7 +17,7 @@ High-level outline (from the docstring plan):
     - Train V_head on (s0…s{T-1}) to regress G0…G{T-1}.
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
-
+from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
@@ -95,7 +93,7 @@ class RLConfig:
     wandb_project: str | None = None
 
     # data
-    B: int = 16
+    B: int = 64
     T: int = 64
     H: int = 32
     W: int = 32
@@ -1876,24 +1874,24 @@ def run(cfg: RLConfig):
 
 if __name__ == "__main__":
     cfg = RLConfig(
-        run_name="train_policy_jit",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_fixrewpredbug/checkpoints",
-        use_wandb=False,
+        run_name="train_policy_jit_flippedrew2",
+        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
+        use_wandb=True,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
-        # log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        log_dir="/vast/home/h/hued/projects/tiny_dreamer_4/logs",
-        max_steps=10_000,
+        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
+        max_steps=100_000,
         log_every=100,
         lr=1e-4,
         ckpt_save_every=100_000,
         ckpt_max_to_keep=2,
         write_video_every=1,
         visualize_every=1,
-        eval_every=1000,
+        eval_every=5000,
         eval_episodes=64,
         eval_horizon=32,
         eval_batch_size=64,
+        gamma=0.9,
     )
     print(
         "Running RL config:\n  "
