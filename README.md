@@ -1,13 +1,13 @@
 # Dreamer 4 World Models, in pure JAX
 
+> [!NOTE]
+> See [open-dreamer](https://github.com/next-state/open-dreamer) for the upgraded version of the model that works on Minecraft!
+
 This repo is an unofficial implementation of the **[Dreamer 4](https://danijar.com/project/dreamer4/)** world model and RL agent from *“Training Agents Inside of Scalable World Models”* in pure JAX. This repo is designed to be educational and serve as a starting point for those interested in world models, RL, and Jax. 
 
 ![dreamer4](docs/architecture.png)
 
 At this stage, the entire world model + RL pipeline has been implemented and verified on a small bouncing square dataset. The authors are extending the codebase to solve harder tasks like CoinRun and eventually, Minecraft.  
-
-> [!NOTE]
-> We are looking for support - in terms of compute, advising, or feature development. Please get in touch if interested!
 
 
 - [Website](https://danijar.com/project/dreamer4/)
